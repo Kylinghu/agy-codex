@@ -227,7 +227,7 @@ class InstallerTests(unittest.TestCase):
         plugin = Path(result["plugin"])
         self.assertEqual(plugin, self.home/".gemini/config/plugins/agy-codex")
         self.assertTrue((plugin/"agents/agy-codex.md").is_file())
-        self.assertEqual(json.loads((plugin/"plugin.json").read_text())["name"], "agy-codex")
+        self.assertEqual(json.loads((plugin/"plugin.json").read_text(encoding="utf-8"))["name"], "agy-codex")
         self.assertEqual((plugin/"LICENSE").read_bytes(), (ROOT/"LICENSE").read_bytes())
         self.assertFalse((self.home/".agents").exists())
         self.assertFalse((self.home/".gemini/config/skills/agy-codex").exists())
