@@ -14,7 +14,7 @@ import uuid
 
 SOURCE = Path(__file__).resolve().parent
 MARKER = "INSTALLATION.json"
-PAYLOAD = ("plugin.json", "README.md", "install.py", "agents", "skills")
+PAYLOAD = ("plugin.json", "README.md", "LICENSE", "install.py", "agents", "skills")
 
 
 def files(path):

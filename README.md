@@ -38,8 +38,10 @@ AGY 主 Agent (agents/agy-codex.md · Gemini)
 
 - **Antigravity**（支持 Plugins、Custom Main Agent、Skills 与 `/run-workflow`）
 - **Git**
-- **Python 3.10+**（仅使用标准库，无需 `pip install`）
+- **Python 3.10+**（运行安装器与独立诊断 / 冒烟 CLI；仅使用标准库，无需 `pip install`）
 - **Codex CLI**（已安装并完成 `codex login`，支持 `exec`、`exec resume`、`--json`、`--output-last-message`、`--output-schema`）
+
+Antigravity 的 `/run-workflow` 默认使用宿主自带的 Python，控制器沿用该解释器。如果需要指定解释器，可按[官方工作流文档](https://antigravity.google/docs/dynamic-workflows/)设置 `ANTIGRAVITY_PYTHON`，并为本插件选择 Python 3.10+。
 
 ---
 
@@ -53,7 +55,7 @@ cd agy-codex
 python install.py --global
 ```
 
-> **Windows 提示**：如果系统 `PATH` 中的 `python` 指向 Microsoft Store 应用别名或未安装 `py` 启动器，请直接使用已安装的 Python 3.10+ 完整路径（例如 `& "C:\Python312\python.exe" install.py --global`），并确保 Antigravity 的 `/run-workflow` 能在 `PATH` 中找到可用的 `python` / `python3`。
+> **Windows 提示**：运行安装器或独立 CLI 时，如果系统 `PATH` 中的 `python` 指向 Microsoft Store 应用别名或未安装 `py` 启动器，请直接使用已安装的 Python 3.10+ 完整路径（例如 `& "C:\Python312\python.exe" install.py --global`）。工作流内继续使用宿主提供或通过 `ANTIGRAVITY_PYTHON` 指定的解释器。
 
 - **全局安装目标**：`~/.gemini/config/plugins/agy-codex`
 - **项目级安装**：`python install.py --project /path/to/your/repo`（安装至 `.agents/plugins/agy-codex`）
@@ -99,7 +101,8 @@ agy plugin list
 
 - **状态存储**：所有控制器元数据保存在目标仓库的 `<git-dir>/superagent/` 下（包含 `plans/`、`tickets/`、基线快照、独立测试日志与 `diff.patch`），不污染用户工作区文件，也不随插件目录删除而丢失。
 - **Git 纪律**：本工具**绝不自动执行** `git add`、`commit`、`push`、`merge`、`reset`、`clean` 或切换分支。
-- **范围控制 (`allowed_paths`)**：支持相对文件路径、目录前缀（`src/` 或 `src`）、Glob 通配符（`tests/test_*.py`、`**/*.ts`）以及仓库根通配（`.`）。
+- **范围控制 (`allowed_paths`)**：路径从仓库根开始匹配；支持相对文件、目录前缀（`src/` 或 `src`）、Glob（`tests/test_*.py`、`**/*.ts`）以及整个仓库（`.`）。`*`、`?`、字符组只匹配单个路径段，`**` 匹配零层或多层目录。
+- **被 Git 忽略的目标文件**：在 `allowed_paths` 中明确写出文件路径（例如 `local-config.json`），即使文件尚未创建也会跟踪其后续创建、修改和删除。目录前缀或 Glob 不会展开被忽略的依赖／构建目录。
 - **轮次上限**：单个任务最多 3 轮实现（`max_rounds <= 3`），禁止通过新建同名任务绕过轮次限制；只读复审格式异常时仅在同一只读会话内纠正一次。
 
 ---
@@ -111,6 +114,8 @@ agy plugin list
 ```bash
 python -B -m unittest discover -s tests -v
 ```
+
+GitHub Actions 在 Ubuntu、Windows 与 Python 3.10、3.12 的四种组合上运行同一套离线测试，覆盖协议、任务恢复、进程清理和安装行为。测试使用 Codex / AGY 替身，不需要模型账号或密钥；真实模型与宿主的交互通过下面的实机冒烟测试验证。
 
 ### 实机冒烟测试（可选）
 

@@ -22,7 +22,7 @@ import threading
 import time
 import uuid
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 TERMINAL = {"PASS", "ESCALATE"}
 ISSUE_FIELDS = ("kind", "detail", "evidence", "question", "recommendation")
 WORKER_SCHEMA = {
@@ -302,8 +302,12 @@ def validate_spec(spec):
     if not isinstance(commands, list) or not commands or not all(isinstance(c, list) and c and all(isinstance(x, str) and x for x in c) for c in commands):
         raise WorkflowError("test_commands must contain argv arrays, for example [['{python}', '-m', 'unittest']].")
     scope = spec.get("allowed_paths")
-    if scope is not None and (not isinstance(scope, list) or not scope or not all(isinstance(x, str) and x and not x.startswith(('/', '\\')) and '..' not in Path(x).parts and ':' not in x for x in scope)):
-        raise WorkflowError("allowed_paths must contain relative file names, directory prefixes, or glob patterns.")
+    if scope is not None and (not isinstance(scope, list) or not scope or not all(
+            isinstance(x, str) and x and not x.startswith(('/', '\\')) and ':' not in x
+            and '..' not in PurePosixPath(x.replace('\\', '/')).parts
+            and PurePosixPath(x.replace('\\', '/')).parts[:1] != ('.git',)
+            for x in scope)):
+        raise WorkflowError("allowed_paths must contain repository-relative files, directory prefixes, or globs outside Git metadata.")
     limit = spec.get("max_rounds", 3)
     if type(limit) is not int or not 1 <= limit <= 3:
         raise WorkflowError("max_rounds must be an integer from 1 through 3.")
@@ -347,14 +351,48 @@ class Controller:
                                     "round": state["round"], "session_id": state["session_id"]}, ensure_ascii=False) + "\n")
                 f.flush(); os.fsync(f.fileno())
 
-    def snapshot(self):
+    def _active_snapshot_paths(self):
+        active = self.root / "active.json"
+        return self.load(read_json(active)["ticket_id"]).get("snapshot_paths", []) if active.exists() else []
+
+    def _explicit_file_paths(self, scope):
+        """Include named files, including future files, without walking ignored trees."""
+        paths = set()
+        for raw in scope or []:
+            name = raw.replace("\\", "/")
+            if name.endswith("/") or any(c in name for c in "*?["):
+                continue
+            name = PurePosixPath(name).as_posix()
+            path = self.repo / name
+            if name != "." and (path.is_symlink() or not path.is_dir()):
+                paths.add(name)
+        return paths
+
+    def snapshot_for(self, state):
+        if "snapshot_paths" not in state:
+            candidates = self._explicit_file_paths(state["spec"].get("allowed_paths"))
+            if candidates and git(self.repo, "check-ignore", "--", *sorted(candidates), allowed=(0, 1)):
+                raise WorkflowError("This legacy Ticket did not capture explicitly allowed ignored files. "
+                                    "Close it and start a new scoped Ticket to record their baseline before continuing.")
+        return self.snapshot(state.get("snapshot_paths", []))
+
+    def snapshot(self, paths=None):
         head = git(self.repo, "rev-parse", "HEAD").decode().strip()
         index = git(self.repo, "ls-files", "--stage", "-z")
         if any(row.startswith(b"160000 ") for row in index.split(b"\0") if row):
             raise WorkflowError("This MVP requires a worktree without submodules; split a submodule into its own Ticket.")
-        names = git(self.repo, "ls-files", "--cached", "--others", "--exclude-standard", "-z")
+        names = set(git(self.repo, "ls-files", "--cached", "--others", "--exclude-standard", "-z").split(b"\0")) - {b""}
+        for name in self._active_snapshot_paths() if paths is None else paths:
+            path = self.repo / name
+            parent = path.parent.resolve()
+            if not parent.is_relative_to(self.repo) or parent.is_relative_to(self.gitdir):
+                raise WorkflowError("Explicit task path must stay inside the worktree and outside Git metadata: " + name)
+            # A missing literal target may later become a directory prefix. Its
+            # Git-visible children are already listed; never walk ignored trees.
+            if path.is_symlink() or path.is_file():
+                names.add(os.fsencode(name))
         files = {}
-        for raw in sorted(set(names.split(b"\0")) - {b""}):
+        for raw in sorted(names):
             name = os.fsdecode(raw)
             path = self.repo / name
             if path.is_symlink():
@@ -396,10 +434,13 @@ class Controller:
             self._active()
             if directory.exists():
                 raise WorkflowError("Ticket already exists; use status/run/recover instead of replacing it.")
-            snap = self.snapshot()
-            if expected_sha256 is not None and snap["sha256"] != expected_sha256:
+            previous_paths = self._active_snapshot_paths()
+            snapshot_paths = sorted(set(previous_paths) | self._explicit_file_paths(scope))
+            snap = self.snapshot(snapshot_paths)
+            if expected_sha256 is not None and self.snapshot(previous_paths)["sha256"] != expected_sha256:
                 raise WorkflowError("Worktree changed between plan steps; inspect the change before starting the next task.")
             state = {"schema_version": 2, "baseline_format": "files-v1", "id": ticket_id, "spec": spec, "status": "READY", "round": 0,
+                     "snapshot_paths": snapshot_paths,
                      "max_rounds": limit, "session_id": None, "worktree": str(self.repo), "git_dir": str(self.gitdir),
                      "codex_home": str(Path(os.environ.get("CODEX_HOME", str(Path.home()/'.codex'))).resolve()),
                      "base_commit": snap["head"], "expected_sha256": snap["sha256"], "created_at": now(),
@@ -408,7 +449,7 @@ class Controller:
             directory.mkdir(parents=True)
             try:
                 self._capture_files(snap, directory/"baseline-files", [n for n in snap["files"] if self._in_scope(n, scope)])
-                if self.snapshot()["sha256"] != snap["sha256"]:
+                if self.snapshot(snapshot_paths)["sha256"] != snap["sha256"]:
                     raise WorkflowError("Worktree changed while capturing the task baseline; retry after the other writer finishes.")
                 atomic_json(directory / "baseline.json", snap)
                 atomic_json(directory / "contract.json", spec)
@@ -536,7 +577,7 @@ class Controller:
             current_home = str(Path(os.environ.get("CODEX_HOME", str(Path.home()/'.codex'))).resolve())
             if state["host"] != socket.gethostname() or state["codex_home"] != current_home:
                 return self._escalate(state, "Host or CODEX_HOME changed; session provenance must be reconciled.")
-            if self.snapshot()["sha256"] != state["expected_sha256"]:
+            if self.snapshot_for(state)["sha256"] != state["expected_sha256"]:
                 return self._escalate(state, "Worktree changed outside this Ticket since the last recorded snapshot.")
             launcher = self.codex_cmd or resolve_codex()
             state.update(status="RUNNING", round=state["round"]+1, runner_pid=os.getpid(), reason=None,
@@ -601,27 +642,27 @@ class Controller:
     def _in_scope(name, scope):
         if not scope:
             return True
-        norm_name = name.replace("\\", "/")
+        norm_name = PurePosixPath(name.replace("\\", "/")).as_posix()
+        parts = norm_name.split("/")
         for raw in scope:
             p = raw.replace("\\", "/")
-            while p.startswith("./"):
-                p = p[2:]
-            if p in {"", "."}:
+            directory = p.endswith("/")
+            p = PurePosixPath(p).as_posix()
+            if p == ".":
                 return True
-            if p.endswith("/"):
-                prefix = p.rstrip("/")
-                if any(c in prefix for c in "*?["):
-                    if fnmatch.fnmatchcase(norm_name, p + "*"):
-                        return True
-                elif norm_name.startswith(prefix + "/"):
+            if not any(c in p for c in "*?["):
+                if norm_name.startswith(p + "/") or (not directory and norm_name == p):
                     return True
-            elif "**" in p:
-                if PurePosixPath(norm_name).match(p):
-                    return True
-            elif any(c in p for c in "*?["):
-                if fnmatch.fnmatchcase(norm_name, p):
-                    return True
-            elif norm_name == p or norm_name.startswith(p + "/"):
+                continue
+            patterns = p.split("/") + (["*", "**"] if directory else [])
+            positions = {0}
+            for pattern in patterns:
+                if pattern == "**":
+                    positions = set(range(min(positions), len(parts) + 1)) if positions else set()
+                else:
+                    positions = {i + 1 for i in positions
+                                 if i < len(parts) and fnmatch.fnmatchcase(parts[i], pattern)}
+            if len(parts) in positions:
                 return True
         return False
 
@@ -702,7 +743,7 @@ class Controller:
 
     def _prepare_review(self, state):
         directory = self._round_dir(state)
-        before = self.snapshot()
+        before = self.snapshot_for(state)
         if before["head"] != state["base_commit"]:
             return self._escalate(state, "HEAD changed during the Ticket; no automatic Git repair was attempted.")
         baseline = read_json(self.ticket_dir(state["id"])/"baseline.json")
@@ -742,11 +783,11 @@ class Controller:
                 break
         atomic_json(directory/"tests.json", tests)
         self._progress("stage", stage="evidence")
-        after = self.snapshot()
+        after = self.snapshot_for(state)
         if after["sha256"] != before["sha256"]:
-            return self._escalate(state, "Validation changed non-ignored repository files; use tests that leave source unchanged.")
+            return self._escalate(state, "Validation changed snapshotted repository files; use tests that leave source unchanged.")
         patch = self._task_diff(state, baseline, after, changed)
-        if self.snapshot()["sha256"] != after["sha256"]:
+        if self.snapshot_for(state)["sha256"] != after["sha256"]:
             raise WorkflowError("Worktree changed while capturing review evidence.")
         (directory/"diff.patch").write_bytes(patch)
         atomic_json(directory/"snapshot.json", after)
@@ -759,7 +800,7 @@ class Controller:
                   "diff_path": str(directory/"diff.patch"), "summary_path": str(directory/"summary.json"),
                   "diff_basis": "task-start" if state.get("baseline_format") else "HEAD",
                   "diff_metadata_path": str(directory/"diff-metadata.json") if state.get("baseline_format") else None,
-                  "worker_report": worker_report,
+                  "worker_report": worker_report, "resolutions": state.get("resolutions", []),
                   "last_message_path": str(directory/"last-message.md"), "previous_review": state.get("last_review")}
         atomic_json(directory/"review-packet.json", packet)
         self.save(state, "review_ready")
@@ -769,7 +810,7 @@ class Controller:
         state = self.load(ticket_id)
         if state["status"] != "REVIEW":
             raise WorkflowError("No pending review for this Ticket.")
-        if self.snapshot()["sha256"] != state["expected_sha256"]:
+        if self.snapshot_for(state)["sha256"] != state["expected_sha256"]:
             raise WorkflowError("Review snapshot is stale. Inspect the external change, then refresh the review packet.")
         return read_json(self._round_dir(state)/"review-packet.json")
 
@@ -848,7 +889,7 @@ class Controller:
                 raise WorkflowError("No implementation budget or Session remains for resolution.")
             if pid_alive(state.get("child_pid"), process_group=os.name != "nt"):
                 raise WorkflowError("The previous worker is still alive.")
-            if self.snapshot()["sha256"] != state["expected_sha256"]:
+            if self.snapshot_for(state)["sha256"] != state["expected_sha256"]:
                 raise WorkflowError("Worktree changed while awaiting resolution; inspect the change before continuing.")
             previous = state.get("last_review") or {}
             blocker = previous.get("blocker") or {}
@@ -906,9 +947,10 @@ class Controller:
                         return self._escalate(state, str(exc) or type(exc).__name__, recoverable=True)
             if not state["session_id"] or not (state.get("child_pid") or state.get("last_child_pid")):
                 return self._escalate(state, "Interrupted before worker/session identity was durably recorded; inspect processes manually.")
-            if self.snapshot()["head"] != state["base_commit"]:
+            snapshot = self.snapshot_for(state)
+            if snapshot["head"] != state["base_commit"]:
                 return self._escalate(state, "HEAD changed during interruption.")
-            state.update(child_pid=None, runner_pid=None, expected_sha256=self.snapshot()["sha256"],
+            state.update(child_pid=None, runner_pid=None, expected_sha256=snapshot["sha256"],
                          status="REVISE", recoverable_interruption=False,
                          reason="Interrupted invocation. Inspect current files and continue idempotently in the same Session.")
             state["last_review"] = {"verdict": "REVISE", "summary": state["reason"], "findings": []}

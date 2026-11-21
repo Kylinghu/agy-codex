@@ -144,7 +144,7 @@ def verify(repo, ticket="SMOKE-001"):
     c = Controller(repo); state = c.load(ticket)
     review = state.get("last_review") or {}
     result = {"ticket": brief(state), "agy_review": review.get("reviewer_source") == "agy-research",
-              "snapshot_unchanged": c.snapshot()["sha256"] == state["expected_sha256"]}
+              "snapshot_unchanged": c.snapshot_for(state)["sha256"] == state["expected_sha256"]}
     result["passed"] = state["status"] == "PASS" and result["agy_review"] and result["snapshot_unchanged"]
     # A recorded reviewer source is workflow provenance, not cryptographic host attestation.
     atomic_json(c.root/"smoke-result.json", result)

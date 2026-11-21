@@ -157,7 +157,7 @@ continue the existing SMOKE-001 task. Run the same smoke.py with `verify --repo
 NEW_REPO` after completion. The separate `probe --repo ANOTHER_NEW_REPO` command
 checks real Codex write/resume capability; it is not an AGY review test.
 
-For the 0.4 plan path use setup-plan --repo NEW_PLAN_REPO, then ask AGY to continue
+For the ordered-plan path use setup-plan --repo NEW_PLAN_REPO, then ask AGY to continue
 the saved two-step plan. It should run both steps in one workflow. verify-plan
 checks recorded per-task reviews and the final snapshot. Observe real UI progress
 and, if practical, cancel/continue once; saved source labels do not attest the host.

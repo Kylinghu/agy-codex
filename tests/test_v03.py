@@ -83,6 +83,54 @@ class AgyCodexTests(unittest.TestCase):
             self.c.resolve(self.f.ticket_id, "duplicate", "user", expected_round=1)
         self.assertEqual(len(self.f.calls()), 2)
 
+    def test_fresh_reviewer_restores_user_resolution_after_another_revision(self):
+        self.f.mode("decision", kind="product_decision")
+        first = self.c.run(self.f.ticket_id)
+        self.escalation("product_decision")
+        answer = "Preserve the legacy positive-integer behavior."
+        resolved = self.c.resolve(self.f.ticket_id, answer, "user", expected_round=1)
+        resolutions = resolved["resolutions"]
+        original_spec = resolved["spec"]
+        self.f.mode("success")
+        self.c.run(self.f.ticket_id)
+        self.c.verdict(self.f.ticket_id, self.f.review("REVISE"))
+        self.assertNotIn(answer, json.dumps(self.c.load(self.f.ticket_id)["last_review"]))
+
+        # A new host workflow must restore the earlier choice, even though the
+        # latest review now contains only an unrelated repair finding.
+        self.c = self.f.new_controller()
+        self.f.controller = self.c
+        packets = []
+        async def reviewer(prompt, schema):
+            packets.append(json.loads(prompt.split("\n\nREVIEW_PACKET\n", 1)[1]))
+            return self.f.review()
+        result = self.workflow(reviewer)
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["round"], 3)
+        self.assertEqual(packets[0]["review_mode"], "full")
+        self.assertEqual(packets[0].get("resolutions"), resolutions)
+        state = self.c.load(self.f.ticket_id)
+        saved = json.loads((self.c._round_dir(state) / "review-packet.json").read_text())
+        self.assertEqual(saved.get("resolutions"), resolutions)
+        self.assertEqual(state["spec"], original_spec)
+        self.assertEqual(state["session_id"], first["session_id"])
+        self.assertEqual(len(self.f.calls()), 3)
+
+    def test_review_input_restores_resolutions_from_ticket_for_legacy_packets(self):
+        self.c.run(self.f.ticket_id)
+        self.escalation("product_decision")
+        self.c.resolve(self.f.ticket_id, "Keep the compatible public behavior.", "user", expected_round=1)
+        state = self.c.run(self.f.ticket_id)
+        packet = self.c.packet(self.f.ticket_id)
+        packet.pop("resolutions", None)  # Saved by a controller before this field existed.
+        for fresh in (True, False):
+            with self.subTest(fresh=fresh):
+                data = product.review_input(self.c, state, packet, fresh)
+                self.assertEqual(data.get("resolutions"), state["resolutions"])
+                self.assertEqual(data["review_mode"], "full" if fresh else "followup")
+                self.assertEqual("spec" in data, fresh)
+        self.assertNotIn("resolutions", packet)
+
     def test_permission_blocker_is_not_pass_or_code_defect_or_textual_grant(self):
         self.f.mode("permission")
         self.c.run(self.f.ticket_id)

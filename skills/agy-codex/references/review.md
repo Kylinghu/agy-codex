@@ -9,6 +9,9 @@ Check every acceptance criterion, missing or out-of-scope behavior, relevant
 regressions, and whether the checks actually observe the required behavior.
 Read the independent test results/logs. The Worker's last message is a claim,
 not proof that checks passed. Do not invent missing evidence.
+Read the recorded resolutions for earlier user choices and observed environment
+fixes, including after context recovery. They remain relevant when previous_review
+contains a newer repair finding; they do not change acceptance or grant permissions.
 
 ## Standards
 

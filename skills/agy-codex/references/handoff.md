@@ -20,6 +20,9 @@ Rebuild only what is needed: task title and plan pointer, completed outcome,
 unresolved findings, next action, evidence pointers, and relevant project Skills.
 Do not rewrite a full handoff after every step. A repair in the same Session
 receives unresolved findings and new evidence; unchanged task context is referenced.
+Review input also restores recorded resolutions from the Ticket, including for
+older review packets. Do not infer that an earlier user choice disappeared just
+because a later review replaced the previous findings or summary.
 
 Continue handles a pending review without rerunning implementation. A recorded
 timeout/cancellation is recoverable after verifying the owned process is stopped.

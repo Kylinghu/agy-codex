@@ -35,9 +35,19 @@ existing results become the new starting point without an intermediary commit.
 If the user changes scope, preserve the old plan's evidence and form the new
 agreed scope instead of replacing contracts in place.
 
+When several steps change coupled behavior, include an appropriate final
+integration/regression task in the agreed plan, or make those checks part of its
+last task. Use the project's existing check commands to verify the combined result
+and the earlier behavior affected by later steps. Define this acceptance when
+preparing the plan so it runs automatically within the same workflow.
+
 Choose practical allowed_paths and deterministic argv test_commands from the project.
 Supports exact relative files, directory prefixes (e.g. `src/` or `src`), glob
 patterns (e.g. `tests/test_*.py` or `**/*.ts`), and `.` for repo-wide refactors.
+Patterns are anchored at the repository root: ordinary wildcards stay within a
+path component, while `**` spans zero or more directories. Name an ignored target
+file explicitly, including before creation; directory prefixes and globs do not
+expand ignored dependency or build trees.
 Avoid overly brittle file-by-file lists when a task may touch helper or test
 files in a module; prefer module directories or globs so Codex is not falsely
 escalated for touching an in-scope helper. Keep independent acceptance fixtures

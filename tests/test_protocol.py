@@ -24,6 +24,8 @@ if sa is None or Path(sa.__file__).resolve() != SOURCE.resolve():
     sys.modules[module_spec.name] = sa
     module_spec.loader.exec_module(sa)
 FAKE = Path(__file__).with_name("fake_codex.py").resolve()
+sys.path.insert(0, str(SOURCE.parent))
+import product
 
 
 class ProtocolTests(unittest.TestCase):
@@ -280,6 +282,136 @@ class ProtocolTests(unittest.TestCase):
         self.assertTrue(in_scope("pkg/sub/file.ts", ["**/*.ts"]))
         self.assertTrue(in_scope("anything/here.txt", ["."]))
         self.assertTrue(in_scope("src/a.py", [".\\src\\"]))
+
+    def test_globs_are_root_anchored_and_match_complete_path_components(self):
+        cases = [
+            ("index.ts", "**/*.ts", True),
+            ("src/a.py", "src/**/*.py", True),
+            ("src/sub/deep/a.py", "src/**/*.py", True),
+            ("other/src/sub/a.py", "src/**/*.py", False),
+            ("src/sub/a.py", "src/*.py", False),
+            ("src/a.py", "*.py", False),
+            ("src/a.py", "src/?.py", True),
+            ("src/ab.py", "src/?.py", False),
+            ("src/a.py", "src/[ab].py", True),
+            ("src/c.py", "src/[ab].py", False),
+            ("src/sub/a.py", "src/*/", True),
+            ("src/sub/deep/a.py", "src/*/", True),
+            ("src/a.py", "src/*/", False),
+            ("src/sub/a.py", ".\\src\\**\\*.py", True),
+        ]
+        for name, pattern, expected in cases:
+            with self.subTest(name=name, pattern=pattern):
+                self.assertEqual(sa.Controller._in_scope(name, [pattern]), expected)
+
+    def test_recursive_glob_allows_root_file_through_review(self):
+        self.create(allowed_paths=["**/*.py"])
+        state = self.controller.run(self.ticket_id)
+        self.assertEqual(state["status"], "REVIEW", state)
+        self.assertEqual(self.controller.packet(self.ticket_id)["changed_files"], ["value.py"])
+        self.assertEqual(self.controller.verdict(self.ticket_id, self.review())["status"], "PASS")
+
+    def test_explicit_ignored_file_has_baseline_diff_and_stale_review_protection(self):
+        (self.repo / ".gitignore").write_text("__pycache__/\nlocal-config.json\ncache/\n")
+        config = self.repo / "local-config.json"
+        config.write_text("old\n")
+        (self.repo / "cache").mkdir()
+        (self.repo / "cache" / "unrelated.bin").write_bytes(b"ignored build output")
+        self.create(allowed_paths=["local-config.json", "cache/"], test_commands=[
+            ["{python}", "-c", "from pathlib import Path; assert Path('local-config.json').read_text() == 'new\\n'"]])
+        self.mode("files", files={"local-config.json": "new\n"})
+        state = self.controller.run(self.ticket_id)
+        self.assertEqual(state["status"], "REVIEW", state)
+        packet = self.controller.packet(self.ticket_id)
+        self.assertEqual(packet["changed_files"], ["local-config.json"])
+        patch = Path(packet["diff_path"]).read_text()
+        self.assertIn("-old", patch)
+        self.assertIn("+new", patch)
+        baseline = sa.read_json(self.controller.ticket_dir(self.ticket_id) / "baseline.json")
+        self.assertIn("local-config.json", baseline["files"])
+        self.assertNotIn("cache/unrelated.bin", baseline["files"])
+        stale = self.review(packet=packet)
+        config.write_text("external edit\n")
+        self.controller = self.new_controller()
+        with self.assertRaisesRegex(sa.WorkflowError, "stale"):
+            self.controller.verdict(self.ticket_id, stale)
+        config.write_text("new\n")
+        state = self.controller.verdict(self.ticket_id, stale)
+        self.assertTrue(product.report(self.controller, state)["verified"])
+        config.write_text("external edit after PASS\n")
+        self.assertFalse(product.report(self.controller, state)["verified"])
+
+    def test_new_explicit_ignored_file_is_captured_without_scanning_ignored_directory(self):
+        (self.repo / ".gitignore").write_text("__pycache__/\ncache/\n")
+        created = self.create(allowed_paths=["cache/new-config.json"], test_commands=[
+            ["{python}", "-c", "from pathlib import Path; assert Path('cache/new-config.json').read_text() == 'new\\n'"]])
+        self.assertIn("cache/new-config.json", created["snapshot_paths"])
+        self.mode("files", files={"cache/new-config.json": "new\n"})
+        state = self.controller.run(self.ticket_id)
+        self.assertEqual(state["status"], "REVIEW", state)
+        packet = self.controller.packet(self.ticket_id)
+        self.assertEqual(packet["changed_files"], ["cache/new-config.json"])
+        self.assertIn("new file mode", Path(packet["diff_path"]).read_text())
+        self.assertEqual(self.controller.verdict(self.ticket_id, self.review())["status"], "PASS")
+
+    def test_explicit_ignored_file_deletion_and_recreation_invalidate_evidence(self):
+        (self.repo / ".gitignore").write_text("__pycache__/\nlocal-config.json\n")
+        config = self.repo / "local-config.json"
+        config.write_text("old\n")
+        self.create(allowed_paths=["local-config.json"], test_commands=[
+            ["{python}", "-c", "from pathlib import Path; p=Path('local-config.json'); assert not p.exists() or p.read_text() == 'new\\n'"]])
+        self.mode("files", files={"local-config.json": None})
+        state = self.controller.run(self.ticket_id)
+        self.assertEqual(state["status"], "REVIEW", state)
+        packet = self.controller.packet(self.ticket_id)
+        self.assertEqual(packet["changed_files"], ["local-config.json"])
+        self.assertIn("deleted file mode", Path(packet["diff_path"]).read_text())
+        stale = self.review(packet=packet)
+        config.write_text("new\n")
+        with self.assertRaisesRegex(sa.WorkflowError, "stale"):
+            self.controller.verdict(self.ticket_id, stale)
+        self.controller.refresh(self.ticket_id)
+        refreshed = self.controller.packet(self.ticket_id)
+        self.assertNotEqual(packet["snapshot_sha256"], refreshed["snapshot_sha256"])
+        self.assertIn("+new", Path(refreshed["diff_path"]).read_text())
+        self.assertEqual(self.controller.verdict(self.ticket_id, self.review())["status"], "PASS")
+
+    def test_ignored_file_task_can_transition_to_an_ordinary_task(self):
+        (self.repo / ".gitignore").write_text("__pycache__/\nlocal-config.json\n")
+        self.create(allowed_paths=["local-config.json"], test_commands=[
+            ["{python}", "-c", "from pathlib import Path; assert Path('local-config.json').read_text() == 'new\\n'"]])
+        self.mode("files", files={"local-config.json": "new\n"})
+        self.controller.run(self.ticket_id)
+        first = self.controller.verdict(self.ticket_id, self.review())
+        self.ticket_id = "NEXT"
+        self.controller.create({"id": self.ticket_id, "title": "Follow-up", "goal": "Update VALUE",
+                                "acceptance": ["VALUE is positive"], "allowed_paths": ["value.py"],
+                                "test_commands": [["{python}", "-c", "from value import VALUE; assert VALUE > 0"]]},
+                               expected_sha256=first["expected_sha256"])
+        self.mode("success")
+        state = self.controller.run(self.ticket_id)
+        self.assertEqual(state["status"], "REVIEW", state)
+        state = self.controller.verdict(self.ticket_id, self.review())
+        self.controller = self.new_controller()
+        self.assertTrue(product.report(self.controller, state)["verified"])
+        self.assertEqual(self.controller.snapshot()["sha256"], state["expected_sha256"])
+        (self.repo / "local-config.json").write_text("regression\n")
+        self.assertFalse(product.report(self.controller, state)["verified"])
+
+    def test_legacy_tickets_keep_visible_file_evidence_but_reject_ignored_targets(self):
+        state = self.create()
+        del state["snapshot_paths"]
+        self.controller.save(state)
+        self.assertEqual(self.controller.run(self.ticket_id)["status"], "REVIEW")
+        self.controller.verdict(self.ticket_id, self.review())
+        self.ticket_id = "LEGACY-IGNORED"
+        (self.repo / ".gitignore").write_text("__pycache__/\nlocal-config.json\n")
+        state = self.create(allowed_paths=["local-config.json"])
+        del state["snapshot_paths"]
+        self.controller.save(state)
+        with self.assertRaisesRegex(sa.WorkflowError, "legacy Ticket.*ignored files"):
+            self.controller.run(self.ticket_id)
+        self.assertEqual(len(self.calls()), 1)
 
     def test_ticket_round_limit_cannot_exceed_three(self):
         with self.assertRaises(sa.WorkflowError):

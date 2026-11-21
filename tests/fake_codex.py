@@ -86,7 +86,19 @@ def main():
         if not ready.exists():
             print("Descendant fixture failed to initialize", file=sys.stderr)
             return 65
-    if mode == "add-delete":
+    if mode == "files":
+        changes = []
+        for name, content in control["files"].items():
+            path = repo / name
+            kind = "update" if path.exists() else "add"
+            if content is None:
+                path.unlink()
+                kind = "delete"
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+            changes.append({"path": name, "kind": kind})
+    elif mode == "add-delete":
         (repo / "value.py").unlink()
         (repo / "created.txt").write_text("new untracked evidence\n", encoding="utf-8")
         changes = [{"path": "value.py", "kind": "delete"},

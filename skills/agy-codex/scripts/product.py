@@ -118,7 +118,7 @@ def report(controller, state=None):
     packet_path = directory / "review-packet.json"
     packet = read_json(packet_path) if packet_path.exists() else {}
     tests = packet.get("tests", [])
-    current = None if state["status"] == "RUNNING" else controller.snapshot()["sha256"] == state["expected_sha256"]
+    current = None if state["status"] == "RUNNING" else controller.snapshot_for(state)["sha256"] == state["expected_sha256"]
     progress_path = controller.ticket_dir(state["id"]) / "progress.json"
     progress = read_json(progress_path) if progress_path.exists() else None
     title = state["spec"]["title"]
@@ -175,6 +175,9 @@ def review_input(controller, state, packet, fresh):
             previous = read_json(previous_path)
             current = read_json(controller._round_dir(state)/"snapshot.json")
             data["files_changed_since_review"] = controller._changed(current, previous)
+    # Decisions outlive last_review, which later REVISE verdicts replace. Rebuild
+    # from the Ticket for both modes, including packets saved before this field.
+    data["resolutions"] = state.get("resolutions", [])
     return data
 
 
@@ -183,7 +186,8 @@ def reviewer_prompt(data):
     opening = contract("review") if mode == "full" else (
         "Continue the same read-only Spec and Standards review. Start with files_changed_since_review "
         "and unresolved_findings. Reuse the unchanged contract already in context; read contract_path "
-        "if context is missing. The diff_path is the COMPLETE cumulative worktree diff, not a delta patch. "
+        "if context is missing. Retain recorded resolutions within that contract; they do not change permissions. "
+        "The diff_path is the COMPLETE cumulative worktree diff, not a delta patch. "
         "Check interactions with previously reviewed changes before PASS. Do not edit, run tests, "
         "or start another agent. Copy the exact ticket_id, round and snapshot_sha256. Return the schema "
         "with both axes and stable finding IDs."
