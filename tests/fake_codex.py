@@ -33,7 +33,7 @@ def main():
     if schema["properties"]["outcome"]["enum"] != ["done", "decision_required", "blocked"]:
         return 64
     requested_session = rest[5] if resumed else None
-    prompt = sys.stdin.read()
+    prompt = sys.stdin.buffer.read().decode("utf-8")
     if not prompt.strip():
         print("A prompt on stdin is required", file=sys.stderr)
         return 64

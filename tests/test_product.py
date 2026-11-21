@@ -220,6 +220,7 @@ class InstallerTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name)/"home with spaces"
         self.home.mkdir()
+        self.home = self.home.resolve()
 
     def test_global_install_is_a_native_plugin_with_runnable_scripts(self):
         result = installer.install(home=self.home)

@@ -19,6 +19,8 @@
   Python 3.10 and 3.12.
 - Add regression coverage for task scope, ignored-file evidence, reviewer
   recovery, and installed license contents.
+- Keep test fixtures portable across Windows temporary-path aliases and
+  non-UTF-8 process encodings.
 - Clarify the Python interpreter used by Antigravity workflows and place relevant
   final integration checks in plans that change coupled behavior.
 

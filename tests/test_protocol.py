@@ -505,7 +505,9 @@ class ProtocolTests(unittest.TestCase):
     def test_prompt_metacharacters_remain_stdin_data(self):
         text = '保持中文和换行\nquote " backtick ` dollar $(echo INJECTION) & semicolon ;'
         self.create(goal=text)
-        state = self.controller.run(self.ticket_id)
+        # The wire protocol stays UTF-8 even when the child uses another locale.
+        with mock.patch.dict(os.environ, {"PYTHONIOENCODING": "cp1252"}):
+            state = self.controller.run(self.ticket_id)
         self.assertEqual(state["status"], "REVIEW", state)
         call = self.calls()[0]
         self.assertEqual(call["argv"][-1], "-")
