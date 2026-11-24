@@ -269,7 +269,11 @@ def run(c, state, launcher, requested, directory, prompt, on_line):
                     if m == "turn/completed":
                         completed[tid] = turn
                 elif m == "thread/tokenUsage/updated" and state.get("app_server_pending"):
-                    if args.get("turnId") and state.get("active_turn_id") in (None, args["turnId"]):
+                    # Resume can replay the previous Turn's usage before
+                    # turn/start binds its new ID. Only the bound current Turn
+                    # may establish or advance this round's usage baseline.
+                    active = state.get("active_turn_id")
+                    if active and args.get("turnId") == active:
                         usage.update(args)
                 elif m in ("item/started", "item/completed"):
                     item = args.get("item") or {}

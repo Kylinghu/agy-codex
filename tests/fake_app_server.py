@@ -121,6 +121,17 @@ def main():
         elif method == "turn/start":
             if params.get("threadId") != state.get("id") or not params.get("outputSchema"):
                 return 64
+            if mode.get("replay_previous_usage") and state["turns"]:
+                # CLI 0.171.0 may replay the previous Turn's last usage
+                # after turn/start arrives but before turn/started or its reply.
+                previous = state["turns"][0]["id"]
+                count = len(state["turns"])
+                notify("thread/tokenUsage/updated", threadId=state["id"], turnId=previous,
+                       tokenUsage={"total": {"inputTokens": 100 + 12*count,
+                                             "cachedInputTokens": 20 + 2*count,
+                                             "outputTokens": 50 + 8*count},
+                                   "last": {"inputTokens": 12, "cachedInputTokens": 2,
+                                            "outputTokens": 8}})
             if mode.get("hold") and (not state["turns"] or mode.get("hold_all")):
                 active = str(uuid.uuid4())
                 notify("turn/started", threadId=state["id"], turn={"id": active, "status": "inProgress"})

@@ -49,6 +49,7 @@ class AppServerTests(unittest.TestCase):
         self.assertEqual(final["status"], "PASS")
 
     def test_resume_preserves_thread_and_allows_model_upgrade(self):
+        self.mode(replay_previous_usage=True)
         self.f.create(codex={"model": "fixture-model", "reasoning_effort": "low"})
         first = self.c.run(self.f.ticket_id)
         self.assertEqual(first["status"], "REVIEW", first)
@@ -58,6 +59,21 @@ class AppServerTests(unittest.TestCase):
         self.assertEqual(second["session_id"], first["session_id"])
         from product import usage
         self.assertEqual(usage(self.c, second)["codex"], {"input_tokens": 24, "cached_input_tokens": 4, "output_tokens": 16})
+        round_one = sa.read_json(self.c._round_dir(first)/"round-usage.json")
+        round_two = sa.read_json(self.c._round_dir(second)/"round-usage.json")
+        self.assertEqual(round_two["baseline"], round_one["latest"])
+        self.assertEqual(round_two["usage"], {"input_tokens": 12, "cached_input_tokens": 2, "output_tokens": 8})
+        # The raw protocol log proves the replay preceded the new Turn binding;
+        # current-Turn notifications arriving before the RPC reply still count.
+        events = [json.loads(line) for line in
+                  (self.c._round_dir(second)/"rpc.jsonl").read_text(encoding="utf-8").splitlines()]
+        replay = next(i for i, e in enumerate(events)
+                      if e.get("method") == "thread/tokenUsage/updated"
+                      and (e.get("params") or {}).get("turnId") == first["last_turn_id"])
+        started = next(i for i, e in enumerate(events)
+                       if e.get("method") == "turn/started"
+                       and (e.get("params") or {}).get("turn", {}).get("id") == second["last_turn_id"])
+        self.assertLess(replay, started)
         self.assertEqual(self.calls("thread/resume")[0]["params"]["threadId"], first["session_id"])
         self.assertEqual(self.calls("turn/start")[1]["params"]["model"], "fixture-upgrade")
 
