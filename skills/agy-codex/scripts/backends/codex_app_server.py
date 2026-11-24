@@ -118,8 +118,8 @@ class Client:
                 raise Interrupted("App Server canceled; inspect the saved Thread before continuing.")
             if time.monotonic() >= deadline:
                 raise Interrupted("App Server RPC/Turn timeout; inspect the saved Thread before continuing.")
-            if tick:
-                tick()
+            if tick and tick():
+                return None
             try:
                 raw = self.incoming.get(timeout=0.1)
             except queue.Empty:
@@ -170,8 +170,12 @@ class Client:
             return event["result"]
 
     def wait(self, predicate, tick=None):
+        def poll():
+            if tick:
+                tick()
+            return predicate()
         while not predicate():
-            event = self._receive(self.deadline, tick)
+            event = self._receive(self.deadline, poll if tick else None)
             if event is not None:
                 raise WorkflowError("Unexpected asynchronous RPC response.")
 
@@ -282,37 +286,132 @@ def run(c, state, launcher, requested, directory, prompt, on_line):
                             "command": item.get("command"), "exit_code": item.get("exitCode"),
                             "status": item.get("status"), "changes": item.get("changes", [])}})
             rpc.notify = notify
-            turn_params = {"threadId": thread_id, "input": [{"type": "text", "text": prompt}],
-                           "outputSchema": WORKER_SCHEMA}
-            if requested.get("model"):
-                turn_params["model"] = requested["model"]
-            if requested.get("reasoning_effort"):
-                turn_params["effort"] = requested["reasoning_effort"]
-            state["app_server_pending"] = True
-            c.save(state, "turn_submitting")
-            started = rpc.call("turn/start", turn_params)
-            tid = (started.get("turn") or {}).get("id")
-            if not isinstance(tid, str) or not tid or state.get("active_turn_id") not in (None, tid):
-                raise WorkflowError("App Server Turn identity could not be reconciled.")
-            state["active_turn_id"] = tid
-            c.save(state, "turn_bound")
-            rpc.wait(lambda: tid in completed)
-            turn = completed[tid]
-            if turn.get("status") == "completed":
-                text = final_text(turn, texts.get(tid))
-                if isinstance(text, str):
-                    (directory/"last-message.md").write_text(text, encoding="utf-8")
-                emit({"type": "turn.completed", "usage": usage.data})
-                atomic_json(directory/"summary.json", {"session_id": thread_id, "exit_code": 0,
-                            "completed": True, "failed": False, "invalid_lines": 0, "usage": usage.data})
-            else:
-                emit({"type": "turn.failed", "error": turn.get("error") or turn.get("status")})
-            state.update(last_turn_id=tid, last_turn_status=turn.get("status"),
-                         app_server_pending=False, active_turn_id=None)
-            c.save(state, "turn_terminal")
-            if turn.get("status") == "interrupted":
-                raise Interrupted("App Server Turn interrupted; continue the same Session.")
-            return 0 if turn.get("status") == "completed" else 1
+            import inbox
+            queued = []
+            next_prompt = prompt
+            while True:
+                # The window is unique to this Turn, including supplement Turns.
+                window = inbox.open_window(c, state)
+                accepted = []
+                interrupt_requested = False
+                tid = None
+                turn = None
+                seen = 0
+                turn_params = {"threadId": thread_id, "input": [{"type": "text", "text": next_prompt}],
+                               "outputSchema": WORKER_SCHEMA}
+                if requested.get("model"):
+                    turn_params["model"] = requested["model"]
+                if requested.get("reasoning_effort"):
+                    turn_params["effort"] = requested["reasoning_effort"]
+                state.update(app_server_pending=True, active_turn_id=None)
+                c.save(state, "turn_submitting")
+                try:
+                    started = rpc.call("turn/start", turn_params)
+                    tid = (started.get("turn") or {}).get("id")
+                    if not isinstance(tid, str) or not tid or state.get("active_turn_id") not in (None, tid):
+                        raise WorkflowError("App Server Turn identity could not be reconciled.")
+                    state["active_turn_id"] = tid
+                    c.save(state, "turn_bound")
+                    for message in queued:
+                        accepted.append(inbox.ack(c, message, "rpc_accepted", turn_id=tid,
+                                                  delivery_action="queue"))
+                    def tick():
+                        nonlocal interrupt_requested, seen
+                        if tid in completed or interrupt_requested:
+                            return
+                        for path, candidate in inbox.records(window, "pending"):
+                            if tid in completed or interrupt_requested:
+                                break
+                            action = candidate.get("delivery_action", candidate["action"])
+                            if action == "queue":
+                                continue
+                            message = inbox.claim(window, path)
+                            if message is None:
+                                continue
+                            seen += 1
+                            if seen > inbox.MAX_MESSAGES_PER_WINDOW and action != "interrupt":
+                                inbox.ack(c, message, "rejected", reason="Live message budget reached.")
+                                continue
+                            if action == "steer":
+                                try:
+                                    answer = rpc.call("turn/steer", {"threadId": thread_id,
+                                        "expectedTurnId": tid,
+                                        "input": [{"type": "text", "text": message["text"]}]})
+                                except RpcError as exc:
+                                    if exc.code == -32600 and "no active turn to steer" in exc.message.lower():
+                                        inbox.requeue(window, message)
+                                        continue
+                                    inbox.ack(c, message, "rejected", reason=str(exc))
+                                    continue
+                                if answer.get("turnId") != tid:
+                                    raise WorkflowError("Steer response has unexpected Turn ID.")
+                                accepted.append(inbox.ack(c, message, "rpc_accepted",
+                                                          turn_id=tid, delivery_action="steer"))
+                            elif action == "interrupt":
+                                interrupt_requested = True
+                                try:
+                                    rpc.call("turn/interrupt", {"threadId": thread_id, "turnId": tid})
+                                except RpcError as exc:
+                                    # The response can arrive before the terminal notification.
+                                    # Only the known no-active-turn race is safe to await.
+                                    stale = (exc.code == -32600 and exc.message.strip().lower().rstrip(".")
+                                             in ("no active turn", "no active turn to interrupt"))
+                                    if not stale:
+                                        raise
+                                    inbox.ack(c, message, "deferred", reason="Turn ended before interrupt took effect; pause before further work.")
+                                else:
+                                    accepted.append(inbox.ack(c, message, "rpc_accepted",
+                                                              turn_id=tid, delivery_action="interrupt"))
+                    rpc.wait(lambda: tid in completed, tick=tick)
+                    turn = completed[tid]
+                    status = turn.get("status")
+                    for message in accepted:
+                        inbox.ack(c, message, {"completed": "turn_completed",
+                                  "interrupted": "turn_interrupted"}.get(status, "turn_failed"),
+                                  turn_id=tid)
+                    allow_queue = (status == "completed" and not interrupt_requested and
+                                   state.get("queue_turns", 0) < inbox.MAX_QUEUE_TURNS)
+                    queued, late_interrupt = inbox.drain(c, state, window, allow_queue=allow_queue,
+                                        reason="Turn interrupted/failed or supplement Turn budget reached; submit a new scoped task if needed.")
+                    interrupt_requested = interrupt_requested or late_interrupt
+                except BaseException:
+                    # Preserve accepted/unknown delivery records. No automatic resend.
+                    inbox.drain(c, state, window, allow_queue=False,
+                                reason="Turn outcome needs reconciliation; message was not submitted.")
+                    raise
+                if status == "completed":
+                    text = final_text(turn, texts.get(tid))
+                    if isinstance(text, str):
+                        (directory/"last-message.md").write_text(text, encoding="utf-8")
+                    elif (directory/"last-message.md").exists():
+                        # A supplement's absent report must not reuse a prior Turn's report.
+                        (directory/"last-message.md").unlink()
+                else:
+                    emit({"type": "turn.failed", "error": turn.get("error") or status})
+                # A final completed Turn must be durable before clearing its submission marker.
+                if status == "completed" and not queued:
+                    emit({"type": "turn.completed", "usage": usage.data})
+                    atomic_json(directory/"summary.json", {"session_id": thread_id, "exit_code": 0,
+                                "completed": True, "failed": False, "invalid_lines": 0, "usage": usage.data})
+                state.update(last_turn_id=tid, last_turn_status=status,
+                             app_server_pending=False, active_turn_id=None)
+                c.save(state, "turn_terminal")
+                if status == "interrupted":
+                    raise Interrupted("App Server Turn interrupted; continue the same Session.")
+                if status != "completed":
+                    return 1
+                if queued:
+                    state["queue_turns"] = state.get("queue_turns", 0) + 1
+                    c.save(state, "supplement_turn_reserved")
+                    next_prompt = ("Apply these queued user clarifications in the SAME frozen Ticket. "
+                                   "They do not grant new permissions or change acceptance/scope. "
+                                   "Return the Worker schema for the complete current result.\n"
+                                   + json.dumps([{"id": m["id"], "text": m["text"]} for m in queued],
+                                                ensure_ascii=False))
+                    continue
+                if interrupt_requested:
+                    raise Interrupted("Interrupt arrived as Turn completed; task paused before independent review.")
+                return 0
 
 
 def reconcile(c, state):
@@ -352,6 +451,8 @@ def reconcile(c, state):
             from backends.usage import observed
             atomic_json(directory/"summary.json", {"session_id": state["session_id"], "exit_code": 0,
                         "completed": True, "failed": False, "invalid_lines": 0, "usage": observed(directory)})
+        from inbox import finish_accepted
+        finish_accepted(c, state["id"], state["active_turn_id"], turn["status"])
         state.update(app_server_pending=False, last_turn_id=state["active_turn_id"],
                      last_turn_status=turn["status"], active_turn_id=None)
         c.save(state, "turn_reconciled")

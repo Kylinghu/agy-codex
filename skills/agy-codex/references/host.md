@@ -219,3 +219,19 @@ The existing task/plan `codex` object may include `model_provider`.
 When continuing a Ticket, an explicit tier/override applies only to that Ticket.
 If discovery is unavailable, report that and retain known configured defaults
 instead of inventing quota. Do not repeatedly poll.
+
+## Live user messages during a running workflow
+
+Use the existing independent command tool, not a second /run-workflow call.
+Resolve the same PYTHON, SKILL_DIR and REPO. Run:
+`PYTHON SKILL_DIR/scripts/user_cli.py --repo REPO inbox queue TEXT` for ordinary
+in-scope clarifications, `inbox steer TEXT` only for immediate correction,
+`inbox interrupt` to pause, and `inbox status --json` to inspect saved delivery.
+Pass the user's text as one argv value, never evaluate it as shell code.
+The producer targets only the current Ticket's open App Server Turn window.
+If no window is open, explain that the message was not submitted; do not start
+a duplicate worker. Report queued/accepted/completed transport state accurately;
+only independent review can verify implementation. Deferred and uncertain
+messages need user-visible follow-up, not silent replay. A change to acceptance,
+allowed paths or tests requires interrupt, preserving edits, then a new contract.
+Status is read-only and must not trigger another model.

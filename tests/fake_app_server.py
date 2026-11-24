@@ -17,6 +17,7 @@ def main():
     ledger = root/"fake-app-calls.jsonl"
     pending = None
     loaded = False
+    active = None
     def emit(value):
         print(json.dumps(value), flush=True)
     def record(request):
@@ -42,16 +43,33 @@ def main():
         state["turns"].insert(0, turn)
         save()
         notify("turn/started", threadId=state["id"], turn={"id": tid, "status": "inProgress"})
-        total = {"inputTokens": 100 + 12*len(state["turns"]), "cachedInputTokens": 20+2*len(state["turns"]), "outputTokens": 50+8*len(state["turns"])}
-        for _ in range(2):
-            notify("thread/tokenUsage/updated", threadId=state["id"], turnId=tid,
-                   tokenUsage={"total": total, "last": {"inputTokens": 12, "cachedInputTokens": 2, "outputTokens": 8}})
+        report_usage(tid)
         if mode.get("ambiguous"):
             error(rid, -32603, "ambiguous submission")
             return
         response(rid, {"turn": {"id": tid, "status": "inProgress"}})
         notify("item/completed", threadId=state["id"], turnId=tid, item={
             "type": "fileChange", "changes": [{"path": "value.py", "kind": "update"}]})
+        notify("turn/completed", threadId=state["id"], turn=turn)
+    def report_usage(tid):
+        total = {"inputTokens": 100 + 12*len(state["turns"]), "cachedInputTokens": 20+2*len(state["turns"]), "outputTokens": 50+8*len(state["turns"])}
+        for _ in range(2):
+            notify("thread/tokenUsage/updated", threadId=state["id"], turnId=tid,
+                   tokenUsage={"total": total, "last": {"inputTokens": 12, "cachedInputTokens": 2, "outputTokens": 8}})
+    def finish_active(status="completed"):
+        nonlocal active
+        tid = active
+        items = []
+        if status == "completed":
+            report = {"outcome": "done", "summary": "Fixture implementation",
+                      "changes": ["value.py"], "checks": [], "issue": None}
+            (Path.cwd()/"value.py").write_text("VALUE = " + str(len(state["turns"])+1) + "\n", encoding="utf-8")
+            items = [{"type": "agentMessage", "phase": "final_answer", "text": json.dumps(report)}]
+        turn = {"id": tid, "status": status, "error": None, "items": items}
+        state["turns"].insert(0, turn)
+        save()
+        active = None
+        report_usage(tid)
         notify("turn/completed", threadId=state["id"], turn=turn)
     for line in sys.stdin:
         msg = json.loads(line)
@@ -114,12 +132,41 @@ def main():
                                              "outputTokens": 50 + 8*count},
                                    "last": {"inputTokens": 12, "cachedInputTokens": 2,
                                             "outputTokens": 8}})
-            if mode.get("approval"):
+            if mode.get("hold") and (not state["turns"] or mode.get("hold_all")):
+                active = str(uuid.uuid4())
+                notify("turn/started", threadId=state["id"], turn={"id": active, "status": "inProgress"})
+                response(rid, {"turn": {"id": active, "status": "inProgress"}})
+            elif mode.get("approval"):
                 pending = (rid, params)
                 emit({"id": "server-approval", "method": "item/commandExecution/requestApproval",
                       "params": {"threadId": state["id"]}})
             else:
                 finish(rid, params)
+        elif method == "turn/steer":
+            if not active or params.get("expectedTurnId") != active:
+                error(rid, -32600, "no active turn to steer")
+            elif mode.get("stale_steer"):
+                finish_active()
+                error(rid, -32600, "no active turn to steer")
+            elif mode.get("other_steer_error"):
+                error(rid, -32600, "invalid input")
+                finish_active()
+            else:
+                response(rid, {"turnId": active})
+                finish_active()
+        elif method == "turn/interrupt":
+            if active and params.get("turnId") == active:
+                if mode.get("stale_interrupt"):
+                    error(rid, -32600, "no active turn")
+                    finish_active()
+                elif mode.get("other_interrupt_error"):
+                    error(rid, -32600, "invalid input")
+                    finish_active()
+                else:
+                    response(rid, {})
+                    finish_active("interrupted")
+            else:
+                error(rid, -32600, "no active turn")
         else:
             error(rid, -32601, "unsupported fixture request")
     return 0

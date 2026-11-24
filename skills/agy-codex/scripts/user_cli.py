@@ -17,6 +17,11 @@ def main(argv=None):
     status = commands.add_parser("status")
     status.add_argument("--ticket")
     status.add_argument("--json", action="store_true")
+    inbox = commands.add_parser("inbox")
+    inbox.add_argument("operation", choices=("queue", "steer", "interrupt", "status"))
+    inbox.add_argument("text", nargs="?", default="")
+    inbox.add_argument("--ticket")
+    inbox.add_argument("--json", action="store_true")
     models = commands.add_parser("models")
     models.add_argument("--json", action="store_true")
     checks = commands.add_parser("doctor")
@@ -43,6 +48,13 @@ def main(argv=None):
             print(json.dumps(probe(c), ensure_ascii=False, indent=2))
             return 0
         ticket_id = active_id(c, args.ticket)
+        if args.action == "inbox":
+            from inbox import publish, history
+            if not ticket_id:
+                raise WorkflowError("No active Ticket.")
+            result = history(c, ticket_id) if args.operation == "status" else publish(c, ticket_id, args.operation, args.text)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
         plan = load_plan(c) if args.ticket is None else None
         result = plan_report(c, plan) if plan else report(c, c.load(ticket_id) if ticket_id else None)
         if args.json:

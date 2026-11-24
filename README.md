@@ -231,3 +231,40 @@ history before another call; a missing Turn ID or unconfirmed outcome requires
 inspection rather than a duplicate execution. Raw RPC notifications are stored
 locally; only selected discovery fields are retained. Test with CLI 0.171.0 or
 a compatible v2 schema before adopting another version.
+
+## Live control (App Server only)
+
+While a running workflow owns an active Turn, the main AGY conversation may
+submit a clarification independently through the existing command tool:
+
+```text
+PYTHON SKILL_DIR/scripts/user_cli.py --repo REPO inbox queue "Preserve the existing input format."
+PYTHON SKILL_DIR/scripts/user_cli.py --repo REPO inbox steer "Prioritize the compatibility fix."
+PYTHON SKILL_DIR/scripts/user_cli.py --repo REPO inbox interrupt
+PYTHON SKILL_DIR/scripts/user_cli.py --repo REPO inbox status --json
+```
+
+Use queue for ordinary in-scope clarification, steer for immediate correction,
+interrupt to pause execution. No workflow or worktree lock is acquired by
+these producers. Each Turn has a unique Maildir publication window: once sealed,
+late publication fails explicitly rather than targeting the next task. An
+accepted RPC is not proof of implementation. On completion all accepted
+clarifications and deferred/unknown delivery records are included in the
+review evidence. The main Router should disclose unfulfilled messages.
+
+A precise stale-steer error (code -32600 with "no active turn to steer") is
+queued for a supplement Turn. Other RPC errors are not silently replayed.
+At most two extra queued Turns are allowed per Ticket, independent of the
+existing three implementation/review rounds; each supplement is on the same
+Thread before independent validation. A bounded batch holds at most 32 messages.
+Messages beyond the budget remain recorded as deferred, not completed.
+A genuine scope/acceptance/test change needs interrupt and a new scoped contract,
+not a steer/queue instruction. An interrupt preserves changes and pauses the
+workflow even if it races completion. Resume uses the original Ticket.
+
+Delivery is explicitly tracked as queued, delivery_unknown, rpc_accepted,
+turn_completed, turn_interrupted, turn_failed, rejected or deferred. Unknown
+delivery after a crash is not auto-resubmitted. Status exposes the saved
+Session, contract summary, last decisions, progress and truncated message text.
+For detailed messages inspect the Ticket's inbox evidence. Full live validation
+of parallel Antigravity command invocation remains a local host test.

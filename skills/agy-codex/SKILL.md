@@ -21,6 +21,8 @@ bundled; installing his entire suite is not required.
 | Execute an existing plan | Read the requested sections; prepare a finite ordered plan using existing decisions, dependencies and acceptance. |
 | Continue | Prefer the saved plan; resume its current task with the original Session and remaining attempts, then advance. |
 | Status | Run `scripts/user_cli.py --repo <workspace> status --json`; no Worker or reviewer. |
+| Clarify during a live App Server Turn | Use independent command tool with `user_cli.py inbox queue TEXT` (default) or `steer TEXT` for immediate correction; see host reference. |
+| Interrupt a live Turn | Use `user_cli.py inbox interrupt`; preserve the current Ticket and changes. |
 | Answer a pending question | Inspect blocker and resolution_allowed; use resolve with actual answer/source and blocked round. |
 | End the plan | After an explicit user instruction, use stop_plan with the stated reason; preserve all evidence. |
 
@@ -50,7 +52,7 @@ permission blockers remain explicit ESCALATE records. If resolution_allowed is t
 record the actual answer or verified environment fix before continuing the same
 Session; resolution grants no additional execution permissions.
 
-At most three implementations per task. Read-only review output correction retries
+At most three implementation/review rounds per task. App Server may consume at most two additional queued clarification Turns per Ticket before review; preserve the frozen contract. Read-only review output correction retries
 once without another Worker call. Do not create a replacement task to hide a fourth
 attempt. Retain the genuine reason when a permission, Session or process check fails.
 
