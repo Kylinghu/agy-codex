@@ -52,6 +52,20 @@ class ProductTests(unittest.TestCase):
                                                    log_fn=self.logs.append, workflow_args=options,
                                                    controller=self.c, preflight=False))
 
+    def test_single_task_workflow_model_override_is_saved(self):
+        self.task["codex"] = {"model": "task-model", "reasoning_effort": "medium"}
+        result = self.call({"action": "start", "task": self.task,
+                            "codex": {"model": "workflow-model"}})
+        self.assertTrue(result["verified"])
+        expected = {"model": "workflow-model", "reasoning_effort": "medium"}
+        state = self.c.load(result["ticket_id"])
+        self.assertEqual(state["spec"]["codex"], expected)
+        self.assertEqual(state["codex_requested"], expected)
+        self.assertEqual(result["codex_requested"], expected)
+        args = self.f.calls()[0]["argv"]
+        self.assertEqual(args[args.index("-m") + 1], "workflow-model")
+        self.assertEqual(args[args.index("-c") + 1], 'model_reasoning_effort="medium"')
+
     def test_start_needs_no_id_or_spec_file_and_runs_integrated_contracts(self):
         result = self.call({"action": "start", "task": self.task})
         self.assertTrue(result["verified"])

@@ -78,6 +78,59 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(self.f.git("rev-parse", "HEAD"), head)
         self.assertTrue(any(phase.startswith("T-02 · 2/2") for phase in self.phases))
 
+    def test_workflow_start_model_overrides_plan_and_task_by_field(self):
+        value = self.plan()
+        value["codex"] = {"model": "plan-default", "reasoning_effort": "medium"}
+        value["tasks"][0]["task"]["codex"] = {"model": "task-first", "reasoning_effort": "low"}
+        result = self.invoke({"action": "start", "plan": value,
+                              "codex": {"model": "workflow-model"}})
+        self.assertTrue(result["verified"])
+        saved = plans.load_plan(self.c, result["plan_id"])
+        expected = [{"model": "workflow-model", "reasoning_effort": "low"},
+                    {"model": "workflow-model", "reasoning_effort": "medium"}]
+        for entry, call, settings in zip(saved["tasks"], self.f.calls(), expected):
+            self.assertEqual(entry["task"]["codex"], settings)
+            self.assertEqual(self.c.load(entry["ticket_id"])["codex_requested"], settings)
+            args = call["argv"]
+            self.assertEqual(args[args.index("-m") + 1], settings["model"])
+            self.assertEqual(args[args.index("-c") + 1],
+                             "model_reasoning_effort=" + json.dumps(settings["reasoning_effort"]))
+        self.assertEqual(len(self.f.calls()), 2)
+
+    def test_continue_model_upgrade_does_not_leak_to_next_plan_step(self):
+        value = self.plan()
+        value["codex"] = {"model": "economy-model", "reasoning_effort": "low"}
+        value["tasks"][0]["task"]["codex"] = {"model": "initial-model"}
+        # Leave the first Ticket in REVIEW, with a saved worker Session.
+        self.decisions = [RuntimeError("Injected offline reviewer failure")]
+        result = self.invoke({"action": "start", "plan": value})
+        self.assertEqual(result["status"], "REVIEW")
+        self.assertEqual(len(self.f.calls()), 1)
+        first_id = result["current"]["ticket_id"]
+        self.c = self.f.new_controller()
+        self.f.controller = self.c
+        # Two repairs of the first Ticket retain its explicit upgrade.
+        self.decisions = ["REVISE", "REVISE", "PASS", "PASS"]
+        result = self.invoke({"action": "continue", "ticket": first_id,
+                              "codex": {"model": "flagship-model", "reasoning_effort": "high"}})
+        self.assertTrue(result["verified"])
+        calls = self.f.calls()
+        self.assertEqual(len(calls), 4)
+        self.assertEqual([x["resume"] for x in calls], [False, True, True, False])
+        self.assertEqual([x["argv"][x["argv"].index("-m") + 1] for x in calls],
+                         ["initial-model", "flagship-model", "flagship-model", "economy-model"])
+        self.assertEqual([x["argv"][x["argv"].index("-c") + 1] for x in calls],
+                         ['model_reasoning_effort="low"', 'model_reasoning_effort="high"',
+                          'model_reasoning_effort="high"', 'model_reasoning_effort="low"'])
+        self.assertEqual(calls[1]["requested_session"], calls[0]["returned_session"])
+        self.assertEqual(calls[2]["requested_session"], calls[0]["returned_session"])
+        self.assertNotEqual(calls[3]["returned_session"], calls[0]["returned_session"])
+        first, second = [self.c.load(row["ticket_id"]) for row in result["tasks"]]
+        self.assertEqual(first["round"], 3)
+        self.assertEqual(first["spec"]["codex"]["model"], "initial-model")
+        self.assertEqual(first["codex_requested"]["model"], "flagship-model")
+        self.assertEqual(second["codex_requested"], value["codex"])
+
     def test_repair_reuses_only_current_session_and_reviewer(self):
         self.decisions = ["REVISE", "PASS", "PASS"]
         result = self.invoke({"action": "start", "plan": self.plan()})

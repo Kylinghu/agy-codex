@@ -198,8 +198,9 @@ not erase its state. Unresolved/recoverable tasks keep the worktree reserved.
 Optional top-level `codex` object accepts `model` (exact CLI model ID) and
 `reasoning_effort` (exact CLI effort). On start, these explicit settings override
 individual task/plan settings and are saved in each task contract. On continue,
-apply only an explicitly requested override to subsequent Worker calls; the
-same Session and remaining round budget are retained. Never rewrite the task
+apply only an explicitly requested override to subsequent Worker calls of the
+current Ticket; the same Session and remaining round budget are retained. When a
+plan advances, its later Tickets retain their original settings. Never rewrite the task
 acceptance or create another Ticket simply to upgrade the Worker. Per-task
 `codex` and plan-level `codex` may be used for different steps. Omit unknown
 settings; do not invent model IDs or unsupported efforts. These are requested

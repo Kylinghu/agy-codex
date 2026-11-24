@@ -128,6 +128,8 @@ async def _run_plan(c, plan, options, agent_fn, phase_fn, log_fn, preflight, *, 
         result = await _run_ticket(c, state["id"], options, agent_fn, step_phase, log_fn, preflight, resolve=resolve)
         resolve = False
         options.pop("ticket", None)
+        # A continue/resolve override belongs only to the current Ticket.
+        options.pop("codex", None)
         if result["status"] != "PASS" or not result.get("verified"):
             if result["status"] == "PASS":
                 result = dict(result, status="BLOCKED")

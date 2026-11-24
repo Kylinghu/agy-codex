@@ -176,7 +176,8 @@ Example (replace with model ID and effort supported by your Codex installation):
 You can also tell AGY to use a specific Codex model/effort for a task or upgrade
 it on continue. Explicit workflow settings override task, plan and plugin defaults.
 Defaults are captured when a Ticket is created; a later explicit continue override
-is retained for the Ticket's subsequent Worker calls. Missing settings are left to
+is retained for the current Ticket's subsequent Worker calls, never inherited by
+later plan steps. Missing settings are left to
 Codex. The plugin passes `-m` and `-c model_reasoning_effort=...` to both exec and
 exec resume, and records the requested values in each invocation. It does not
 edit Codex configuration or change CODEX_HOME, and does not claim to verify the
