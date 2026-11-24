@@ -22,7 +22,7 @@ import threading
 import time
 import uuid
 
-VERSION = "0.1.1"
+VERSION = "0.2.0"
 # Support direct and importlib-loaded Controller entry points, including child probes.
 _scripts_dir = str(Path(__file__).resolve().parent)
 if _scripts_dir not in sys.path:

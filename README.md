@@ -185,7 +185,7 @@ actual served model or isolate account usage limits.
 
 The App Server adapter below adds native protocol discovery and execution. Its integrated host behavior must still be tested on the target computer.
 
-## App Server backend (v0.2 development)
+## App Server backend (v0.2.0)
 
 The existing JSON configuration may specify `"backend": "auto"` (default for
 native CLI: App Server first; exec only on pre-thread initialization failure),
