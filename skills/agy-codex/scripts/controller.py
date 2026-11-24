@@ -874,6 +874,7 @@ class Controller:
         atomic_json(directory/"snapshot.json", after)
         state.update(status="REVIEW", expected_sha256=after["sha256"], runner_pid=None, reason=None,
                      recoverable_interruption=False)
+        from inbox import review_messages
         packet = {"ticket_id": state["id"], "round": state["round"], "snapshot_sha256": after["sha256"],
                   "worktree": str(self.repo), "base_commit": state["base_commit"], "spec": state["spec"],
                   "session_id": state["session_id"], "changed_files": changed, "tests": tests,
@@ -882,6 +883,7 @@ class Controller:
                   "diff_basis": "task-start" if state.get("baseline_format") else "HEAD",
                   "diff_metadata_path": str(directory/"diff-metadata.json") if state.get("baseline_format") else None,
                   "worker_report": worker_report, "resolutions": state.get("resolutions", []),
+                  "inbox_messages": review_messages(self, state["id"]),
                   "last_message_path": str(directory/"last-message.md"), "previous_review": state.get("last_review")}
         atomic_json(directory/"review-packet.json", packet)
         self.save(state, "review_ready")
