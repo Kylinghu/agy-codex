@@ -192,3 +192,16 @@ unknown processes and exhausted rounds cannot be resolved this way. Duplicate or
 stale resolution is rejected, not replayed. To abandon a saved task after an
 explicit user instruction, use controller.py escalate TASK_ID --reason TEXT; do
 not erase its state. Unresolved/recoverable tasks keep the worktree reserved.
+
+## Worker model overrides
+
+Optional top-level `codex` object accepts `model` (exact CLI model ID) and
+`reasoning_effort` (exact CLI effort). On start, these explicit settings override
+individual task/plan settings and are saved in each task contract. On continue,
+apply only an explicitly requested override to subsequent Worker calls; the
+same Session and remaining round budget are retained. Never rewrite the task
+acceptance or create another Ticket simply to upgrade the Worker. Per-task
+`codex` and plan-level `codex` may be used for different steps. Omit unknown
+settings; do not invent model IDs or unsupported efforts. These are requested
+settings, not a server-verified model identity. No changes to CODEX_HOME or
+Codex Desktop defaults are needed.
