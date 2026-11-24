@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from controller import Controller, REVIEW_SCHEMA, WorkflowError, atomic_json, doctor, worktree_lock
+from controller import Controller, REVIEW_SCHEMA, WorkflowError, atomic_json, codex_settings, doctor, worktree_lock
 import plans
 from progress import run_controller, validate_mode
 from product import active_id, report, review_input, reviewer_prompt, start_task
@@ -41,7 +41,7 @@ async def _run_ticket(c, ticket_id, options, agent_fn, phase_fn, log_fn, preflig
             return result
         if state["status"] in {"READY", "REVISE"}:
             phase_fn(f"Codex {'修复' if state['status'] == 'REVISE' else '实现'}：第 {state['round']+1}/{state['max_rounds']} 轮")
-            state = await run_controller(c, c.run, ticket_id, phase_fn, log_fn, progress_mode=progress_mode)
+            state = await run_controller(c, c.run, ticket_id, phase_fn, log_fn, progress_mode=progress_mode, **({"codex": options["codex"]} if options.get("codex") else {}))
             if state["status"] != "REVIEW":
                 continue
         if state["status"] != "REVIEW":
@@ -128,6 +128,8 @@ async def _run_plan(c, plan, options, agent_fn, phase_fn, log_fn, preflight, *, 
         result = await _run_ticket(c, state["id"], options, agent_fn, step_phase, log_fn, preflight, resolve=resolve)
         resolve = False
         options.pop("ticket", None)
+        # A continue/resolve override belongs only to the current Ticket.
+        options.pop("codex", None)
         if result["status"] != "PASS" or not result.get("verified"):
             if result["status"] == "PASS":
                 result = dict(result, status="BLOCKED")
@@ -140,6 +142,8 @@ async def _run_plan(c, plan, options, agent_fn, phase_fn, log_fn, preflight, *, 
 
 async def run_workflow(*, agent_fn, phase_fn, log_fn, workflow_args, workspaces=(), controller=None, preflight=True):
     options = dict(workflow_args or {})
+    if "codex" in options:
+        options["codex"] = codex_settings(options["codex"])
     validate_mode(options.get("progress", "stages"))
     action = options.get("action", "continue")
     if action == "resume":
@@ -170,12 +174,16 @@ async def run_workflow(*, agent_fn, phase_fn, log_fn, workflow_args, workspaces=
         if action == "start":
             if options.get("ticket") or options.get("plan_id"):
                 raise WorkflowError("Start accepts a new contract; use continue with saved identifiers.")
+            override = options.pop("codex", {})
             if options.get("plan") is not None:
-                plan = plans.start_plan(c, options["plan"])
+                plan = plans.start_plan(c, options["plan"], codex=override)
             else:
                 if plans.unfinished(c, plan):
                     raise WorkflowError("An unfinished plan already owns this worktree. Continue it or explicitly stop that plan first.")
-                state = start_task(c, options.get("task"))
+                task = options.get("task")
+                if override and isinstance(task, dict):
+                    task = dict(task, codex=codex_settings(task.get("codex"), override))
+                state = start_task(c, task)
                 if plan:
                     atomic_json(c.root / "active-plan.json", {"plan_id": None})
                 return await _run_ticket(c, state["id"], options, agent_fn, phase_fn, log_fn, preflight)

@@ -83,6 +83,23 @@ def encode(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
 
 
+def _metadata_io(operation):
+    """Bounded retry for transient Windows sharing failures during publication.
+
+    Windows readers can briefly reject open/replace while another handle holds
+    the file. Keep the atomic rename protocol; never retry JSON parse errors,
+    missing files, unrelated I/O failures, or POSIX permission errors.
+    """
+    for delay in (0.01, 0.02, 0.04, 0.08, 0.16, None):
+        try:
+            return operation()
+        except PermissionError as exc:
+            if (sys.platform != "win32" or delay is None
+                    or getattr(exc, "winerror", None) not in (None, 5, 32, 33)):
+                raise
+            time.sleep(delay)
+
+
 def atomic_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -90,14 +107,15 @@ def atomic_json(path, value):
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
             f.write(encode(value)); f.flush(); os.fsync(f.fileno())
-        os.replace(name, path)
+        _metadata_io(lambda: os.replace(name, path))
     finally:
         if os.path.exists(name):
             os.unlink(name)
 
 
 def read_json(path):
-    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    path = Path(path)
+    return json.loads(_metadata_io(lambda: path.read_text(encoding="utf-8-sig")))
 
 
 def git(repo, *args, allowed=(0,)):
@@ -291,6 +309,49 @@ class EventSummary:
         return event
 
 
+def codex_settings(*layers):
+    """Merge explicit worker settings, without modifying Codex's own configuration."""
+    result = {}
+    for layer in layers:
+        if layer is None:
+            continue
+        if not isinstance(layer, dict) or set(layer) - {"model", "reasoning_effort"}:
+            raise WorkflowError("codex must contain only model and/or reasoning_effort.")
+        for key, value in layer.items():
+            pattern = r"[A-Za-z0-9][A-Za-z0-9._:/+\-]*" if key == "model" else r"[a-z][a-z0-9_\-]*"
+            if not isinstance(value, str) or not re.fullmatch(pattern, value):
+                raise WorkflowError(f"Invalid codex {key}: expected a nonempty identifier.")
+            result[key] = value
+    return result
+
+
+def configured_codex(root):
+    """Read optional plugin defaults; project metadata overrides global defaults."""
+    global_path = Path(os.environ.get("AGY_CODEX_CONFIG", str(Path.home() / ".gemini" / "config" / "agy-codex" / "config.json"))).expanduser()
+    result = {}
+    for path in (global_path, root / "config.json"):
+        try:
+            value = read_json(path)
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as exc:
+            raise WorkflowError(f"Cannot read AGY Codex configuration {path}: {exc}") from exc
+        if not isinstance(value, dict):
+            raise WorkflowError(f"AGY Codex configuration must be a JSON object: {path}")
+        result = codex_settings(result, value.get("codex"))
+    return result
+
+
+def codex_exec_flags(settings):
+    settings = codex_settings(settings)
+    flags = []
+    if "model" in settings:
+        flags += ["-m", settings["model"]]
+    if "reasoning_effort" in settings:
+        flags += ["-c", "model_reasoning_effort=" + json.dumps(settings["reasoning_effort"])]
+    return flags
+
+
 def validate_spec(spec):
     """Validate a frozen task without creating state or starting a process."""
     for field in ("title", "goal"):
@@ -308,6 +369,7 @@ def validate_spec(spec):
             and PurePosixPath(x.replace('\\', '/')).parts[:1] != ('.git',)
             for x in scope)):
         raise WorkflowError("allowed_paths must contain repository-relative files, directory prefixes, or globs outside Git metadata.")
+    codex_settings(spec.get("codex"))
     limit = spec.get("max_rounds", 3)
     if type(limit) is not int or not 1 <= limit <= 3:
         raise WorkflowError("max_rounds must be an integer from 1 through 3.")
@@ -429,6 +491,7 @@ class Controller:
         ticket_id = spec.get("id", "")
         directory = self.ticket_dir(ticket_id)
         limit = validate_spec(spec)
+        worker_config = codex_settings(configured_codex(self.root), spec.get("codex"))
         scope = spec.get("allowed_paths")
         with worktree_lock(self.lock):
             self._active()
@@ -441,7 +504,7 @@ class Controller:
                 raise WorkflowError("Worktree changed between plan steps; inspect the change before starting the next task.")
             state = {"schema_version": 2, "baseline_format": "files-v1", "id": ticket_id, "spec": spec, "status": "READY", "round": 0,
                      "snapshot_paths": snapshot_paths,
-                     "max_rounds": limit, "session_id": None, "worktree": str(self.repo), "git_dir": str(self.gitdir),
+                     "max_rounds": limit, "codex_requested": worker_config, "session_id": None, "worktree": str(self.repo), "git_dir": str(self.gitdir),
                      "codex_home": str(Path(os.environ.get("CODEX_HOME", str(Path.home()/'.codex'))).resolve()),
                      "base_commit": snap["head"], "expected_sha256": snap["sha256"], "created_at": now(),
                      "host": socket.gethostname(), "runner_pid": None, "child_pid": None, "last_review": None,
@@ -566,7 +629,7 @@ class Controller:
         self.save(state, "escalated")
         return state
 
-    def run(self, ticket_id):
+    def run(self, ticket_id, *, codex=None):
         with worktree_lock(self.lock):
             state = self.load(ticket_id)
             self._active(state)
@@ -580,7 +643,11 @@ class Controller:
             if self.snapshot_for(state)["sha256"] != state["expected_sha256"]:
                 return self._escalate(state, "Worktree changed outside this Ticket since the last recorded snapshot.")
             launcher = self.codex_cmd or resolve_codex()
-            state.update(status="RUNNING", round=state["round"]+1, runner_pid=os.getpid(), reason=None,
+            saved = state.get("codex_requested")
+            if saved is None:  # Older Tickets inherit defaults once on their next run.
+                saved = codex_settings(configured_codex(self.root), state["spec"].get("codex"))
+            requested = codex_settings(saved, codex)
+            state.update(codex_requested=requested, status="RUNNING", round=state["round"]+1, runner_pid=os.getpid(), reason=None,
                          recoverable_interruption=False, resolution_allowed=False, stop_origin=None)
             directory = self._round_dir(state)
             if directory.exists() and any(directory.iterdir()):
@@ -594,11 +661,12 @@ class Controller:
             argv = [*launcher, "-a", "never", "-s", "workspace-write", "exec"]
             if state["session_id"]:
                 argv += ["resume"]
+            argv += codex_exec_flags(requested)
             argv += ["--json", "-o", str(directory/"last-message.md"), "--output-schema", str(directory/"worker-schema.json")]
             if state["session_id"]:
                 argv += [state["session_id"]]
             argv += ["-"]
-            atomic_json(directory / "invocation.json", {"argv": argv, "cwd": str(self.repo), "started_at": now()})
+            atomic_json(directory / "invocation.json", {"argv": argv, "cwd": str(self.repo), "started_at": now(), "codex_requested": requested})
             summary = EventSummary()
             def on_line(raw):
                 event = summary.feed(raw)
@@ -1040,6 +1108,9 @@ def main(argv=None):
     create = sub.add_parser("create"); create.add_argument("--spec", required=True)
     for name in ("run", "status", "packet", "recover", "refresh"):
         p = sub.add_parser(name); p.add_argument("ticket")
+        if name == "run":
+            p.add_argument("--model")
+            p.add_argument("--reasoning-effort")
     verdict = sub.add_parser("verdict"); verdict.add_argument("ticket"); verdict.add_argument("--file", required=True)
     close = sub.add_parser("escalate"); close.add_argument("ticket"); close.add_argument("--reason", required=True)
     resolution = sub.add_parser("resolve"); resolution.add_argument("ticket")
@@ -1064,6 +1135,8 @@ def main(argv=None):
             result = c.resolve(args.ticket, args.answer, args.source, args.evidence, args.expected_round)
         elif args.command == "status":
             result = c.load(args.ticket)
+        elif args.command == "run":
+            result = c.run(args.ticket, codex={k: v for k, v in {"model": args.model, "reasoning_effort": args.reasoning_effort}.items() if v is not None})
         else:
             result = getattr(c, args.command)(args.ticket)
         print(encode(result if args.command == "packet" else brief(result)), end="")

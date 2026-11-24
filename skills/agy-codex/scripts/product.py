@@ -153,6 +153,7 @@ def report(controller, state=None):
             "next_action": next_action, "snapshot_current": current,
             "verified": state["status"] == "PASS" and current,
             "blocker": blocker, "resolution_allowed": bool(state.get("resolution_allowed")),
+            "codex_requested": state.get("codex_requested"),
             "worker_report": packet.get("worker_report"), "tests": tests,
             "changed_files": packet.get("changed_files", []),
             "recoverable": recovery, "usage": usage(controller, state), "progress": progress,

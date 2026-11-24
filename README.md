@@ -158,3 +158,30 @@ agy-codex/
 
 - 本项目基于 **MIT License** 开源，详见 [LICENSE](./LICENSE)。
 - 规划、任务切片、TDD、代码审查与交接方法论部分改编自 [mattpocock/skills](https://github.com/mattpocock/skills)（MIT License，原许可声明保存在 [mattpocock-license.txt](./skills/agy-codex/references/mattpocock-license.txt)）。
+
+## Codex Worker model configuration
+
+Optional plugin-only JSON configuration (Python 3.10+, no dependencies):
+
+- Global: `~/.gemini/config/agy-codex/config.json` (outside the installed plugin).
+- Per worktree: `<git-dir>/superagent/config.json` (overrides global fields).
+- Optional `AGY_CODEX_CONFIG` environment variable selects the global file.
+
+Example (replace with model ID and effort supported by your Codex installation):
+
+```json
+{"codex": {"model": "gpt-6-luna", "reasoning_effort": "high"}}
+```
+
+You can also tell AGY to use a specific Codex model/effort for a task or upgrade
+it on continue. Explicit workflow settings override task, plan and plugin defaults.
+Defaults are captured when a Ticket is created; a later explicit continue override
+is retained for the current Ticket's subsequent Worker calls, never inherited by
+later plan steps. Missing settings are left to
+Codex. The plugin passes `-m` and `-c model_reasoning_effort=...` to both exec and
+exec resume, and records the requested values in each invocation. It does not
+edit Codex configuration or change CODEX_HOME, and does not claim to verify the
+actual served model or isolate account usage limits.
+
+This increment does not implement App Server, automatic routing, provider
+verification or Inbox. Those require a separate live protocol validation.

@@ -25,6 +25,12 @@ def main():
     resumed = bool(rest and rest[0] == "resume")
     if resumed:
         rest = rest[1:]
+    while rest and rest[0] in ("-m", "-c"):
+        if len(rest) < 2:
+            return 64
+        if rest[0] == "-c" and not rest[1].startswith("model_reasoning_effort="):
+            return 64
+        rest = rest[2:]
     if len(rest) != (7 if resumed else 6) or rest[:2] != ["--json", "-o"] or rest[3] != "--output-schema" or rest[-1] != "-":
         print("Unexpected exec arguments: " + repr(rest), file=sys.stderr)
         return 64

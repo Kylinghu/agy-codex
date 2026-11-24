@@ -5,7 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from controller import WorkflowError, atomic_json, encode, git, now, read_json, validate_spec, worktree_lock
+from controller import WorkflowError, atomic_json, codex_settings, encode, git, now, read_json, validate_spec, worktree_lock
 from product import _plan_ref, active_id, report, start_task, usage
 
 
@@ -87,7 +87,7 @@ def unfinished(controller, plan):
     return bool(plan and not plan.get("stopped") and position(controller, plan)[0] < len(plan["tasks"]))
 
 
-def start_plan(controller, value):
+def start_plan(controller, value, *, codex=None):
     if not isinstance(value, dict) or not isinstance(value.get("title"), str) or not value["title"].strip():
         raise WorkflowError("A plan needs a title and the already-agreed ordered task contracts.")
     rows = value.get("tasks")
@@ -104,6 +104,9 @@ def start_plan(controller, value):
         if not isinstance(row.get("task"), dict) or row["task"].get("id"):
             raise WorkflowError("Plan steps contain task contracts; Ticket IDs are assigned automatically.")
         task = request_contract(row["task"])
+        worker = codex_settings(value.get("codex"), task.get("codex"), codex)
+        if worker:
+            task["codex"] = worker
         if not task.get("allowed_paths"):
             raise WorkflowError("Every plan task needs allowed_paths.")
         validate_spec(task)

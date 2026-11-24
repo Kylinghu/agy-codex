@@ -130,14 +130,14 @@ class ProgressFeed:
                 self.detail_count += 1
 
 
-async def run_controller(controller, method, ticket_id, phase_fn, log_fn, *, progress_mode="stages"):
+async def run_controller(controller, method, ticket_id, phase_fn, log_fn, *, progress_mode="stages", **method_kwargs):
     """Display progress while retaining ownership until subprocess cleanup ends."""
     state = controller.load(ticket_id)
     feed = ProgressFeed(controller, ticket_id, state["round"] + (method == controller.run), mode=progress_mode)
     previous = controller.progress_callback
     controller.progress_callback = feed.emit
     controller.cancel.clear()
-    job = asyncio.get_running_loop().run_in_executor(None, method, ticket_id)
+    job = asyncio.get_running_loop().run_in_executor(None, lambda: method(ticket_id, **method_kwargs))
     try:
         while True:
             done, _ = await asyncio.wait({job}, timeout=POLL_SECONDS)

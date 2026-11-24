@@ -32,6 +32,10 @@ class ProtocolTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="agy-codex-protocol-")
         self.addCleanup(self.temp.cleanup)
+        self.global_config = Path(self.temp.name) / "agy-config.json"
+        patch = mock.patch.dict(os.environ, {"AGY_CODEX_CONFIG": str(self.global_config)})
+        patch.start()
+        self.addCleanup(patch.stop)
         self.repo = Path(self.temp.name) / "repo with spaces"
         self.repo.mkdir()
         self.git("init", "-q")
@@ -139,6 +143,100 @@ class ProtocolTests(unittest.TestCase):
         self.assertTrue(self.calls()[1]["resume"])
         self.assertEqual(self.calls()[1]["requested_session"], first["session_id"])
         self.assertIn("F-001", self.calls()[1]["prompt"])
+
+    def test_worker_settings_are_isolated_and_resume_can_upgrade(self):
+        sa.atomic_json(self.global_config, {"codex": {"model": "example-global", "reasoning_effort": "low"}})
+        sa.atomic_json(self.controller.root / "config.json", {"codex": {"reasoning_effort": "medium"}})
+        state = self.create(codex={"model": "example-task"})
+        self.assertEqual(state["codex_requested"], {"model": "example-task", "reasoning_effort": "medium"})
+        first = self.controller.run(self.ticket_id)
+        self.assertEqual(first["status"], "REVIEW", first)
+        args = self.calls()[0]["argv"]
+        self.assertEqual(args[args.index("-m")+1], "example-task")
+        self.assertEqual(args[args.index("-c")+1], 'model_reasoning_effort="medium"')
+        self.controller.verdict(self.ticket_id, self.review("REVISE"), source="test")
+        sa.atomic_json(self.global_config, {"codex": {"model": "different-default"}})
+        self.controller = self.new_controller()
+        second = self.controller.run(self.ticket_id, codex={"reasoning_effort": "high"})
+        self.assertEqual(second["status"], "REVIEW", second)
+        self.assertEqual(second["session_id"], first["session_id"])
+        args = self.calls()[1]["argv"]
+        self.assertEqual(args[args.index("-m")+1], "example-task")
+        self.assertEqual(args[args.index("-c")+1], 'model_reasoning_effort="high"')
+        record = sa.read_json(self.controller.ticket_dir(self.ticket_id) / "rounds" / "02" / "invocation.json")
+        self.assertEqual(record["codex_requested"], second["codex_requested"])
+        self.assertEqual(product.report(self.controller, second)["codex_requested"], second["codex_requested"])
+
+    def test_windows_metadata_read_retries_transient_permission_error(self):
+        path = self.global_config
+        with mock.patch.object(sa.sys, "platform", "win32"), \
+                mock.patch.object(sa.time, "sleep") as sleep, \
+                mock.patch.object(Path, "read_text", side_effect=[
+                    PermissionError(13, "sharing violation"), '{"value": 1}']) as read:
+            self.assertEqual(sa.read_json(path), {"value": 1})
+        self.assertEqual(read.call_count, 2)
+        sleep.assert_called_once_with(0.01)
+
+    def test_windows_metadata_replace_retries_without_losing_atomicity(self):
+        path = self.global_config
+        sa.atomic_json(path, {"value": "old"})
+        original_replace = os.replace
+        attempts = []
+        def replace(source, destination):
+            attempts.append(source)
+            self.assertEqual(sa.read_json(destination), {"value": "old"})
+            self.assertEqual(sa.read_json(source), {"value": "new"})
+            if len(attempts) == 1:
+                raise PermissionError(13, "sharing violation")
+            return original_replace(source, destination)
+        with mock.patch.object(sa.sys, "platform", "win32"), \
+                mock.patch.object(sa.time, "sleep") as sleep, \
+                mock.patch.object(sa.os, "replace", side_effect=replace):
+            sa.atomic_json(path, {"value": "new"})
+        self.assertEqual(attempts, [attempts[0]] * 2)
+        self.assertEqual(sa.read_json(path), {"value": "new"})
+        sleep.assert_called_once_with(0.01)
+        self.assertFalse(Path(attempts[0]).exists())
+
+    def test_windows_metadata_permanent_failure_is_bounded_and_preserves_old_file(self):
+        path = self.global_config
+        sa.atomic_json(path, {"value": "old"})
+        with mock.patch.object(sa.sys, "platform", "win32"), \
+                mock.patch.object(sa.time, "sleep") as sleep, \
+                mock.patch.object(sa.os, "replace", side_effect=PermissionError(13, "denied")) as replace:
+            with self.assertRaises(PermissionError):
+                sa.atomic_json(path, {"value": "new"})
+        self.assertEqual(replace.call_count, 6)
+        self.assertEqual(sleep.call_count, 5)
+        self.assertEqual(sa.read_json(path), {"value": "old"})
+        self.assertEqual(list(path.parent.glob(path.name + ".*")), [])
+
+    def test_metadata_read_does_not_retry_parse_missing_or_posix_permission_errors(self):
+        path = self.global_config
+        for platform, error in (("win32", FileNotFoundError(2, "missing")),
+                                ("linux", PermissionError(13, "denied"))):
+            with self.subTest(platform=platform, error=error), \
+                    mock.patch.object(sa.sys, "platform", platform), \
+                    mock.patch.object(sa.time, "sleep") as sleep, \
+                    mock.patch.object(Path, "read_text", side_effect=error) as read:
+                with self.assertRaises(type(error)):
+                    sa.read_json(path)
+                self.assertEqual(read.call_count, 1)
+                sleep.assert_not_called()
+        with mock.patch.object(sa.sys, "platform", "win32"), \
+                mock.patch.object(sa.time, "sleep") as sleep, \
+                mock.patch.object(Path, "read_text", return_value="{invalid") as read:
+            with self.assertRaises(json.JSONDecodeError):
+                sa.read_json(path)
+            self.assertEqual(read.call_count, 1)
+            sleep.assert_not_called()
+
+    def test_invalid_model_override_does_not_consume_round(self):
+        self.create()
+        with self.assertRaises(sa.WorkflowError):
+            self.controller.run(self.ticket_id, codex={"reasoning_effort": "high\\nother=true"})
+        self.assertEqual(self.controller.load(self.ticket_id)["round"], 0)
+        self.assertEqual(self.calls(), [])
 
     def test_third_revise_escalates_without_fourth_worker(self):
         self.create()

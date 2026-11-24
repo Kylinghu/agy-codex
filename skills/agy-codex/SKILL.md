@@ -32,7 +32,7 @@ identical start is idempotent. A fresh goal does not reuse an unrelated Session.
 
 ## Execute
 
-Read `references/host.md` for the internal call contract. Invoke AGY's existing
+Read `references/host.md` for the internal call contract. Pass explicitly requested Codex model and reasoning depth in the optional `codex` workflow object; preserve saved settings on ordinary continue. Do not modify Codex's global config. Invoke AGY's existing
 `/run-workflow` capability with saved `scripts/agy_workflow.py`; do not regenerate
 it or ask the user to author JSON, supply IDs, or copy handoff prompts. This is a
 host script using injected globals, not a standalone Python command.
