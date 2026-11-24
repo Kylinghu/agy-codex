@@ -19,9 +19,13 @@ def policy(root):
     allowed = value.get("allowed_providers", [])
     if not isinstance(allowed, list) or not all(isinstance(x, str) and x for x in allowed):
         raise WorkflowError("allowed_providers must be a list of provider IDs.")
-    default = value.get("default_tier", {"economy": "economy", "quality": "heavy"}.get(strategy, "standard"))
-    if not isinstance(default, str) or not default:
-        raise WorkflowError("default_tier must be a tier name.")
+    if "default_tier" in value:
+        default = value["default_tier"]
+        if not isinstance(default, str) or default not in tiers:
+            raise WorkflowError(f"Unknown configured default_tier: {default}")
+    else:
+        implicit = {"economy": "economy", "quality": "heavy"}.get(strategy, "standard")
+        default = implicit if implicit in tiers else None
     upgrade = value.get("allow_upgrade", True)
     if type(upgrade) is not bool:
         raise WorkflowError("allow_upgrade must be boolean.")
@@ -33,7 +37,7 @@ def select(root, tier=None):
     from controller import WorkflowError
     p = policy(root)
     if tier is None:
-        if p["strategy"] == "manual" or not p["tiers"]:
+        if p["strategy"] == "manual" or p["default_tier"] is None:
             return {}
         tier = p["default_tier"]
     if not isinstance(tier, str) or tier not in p["tiers"]:
@@ -67,8 +71,9 @@ def discover(rpc, provider=None, *, include_rates=True):
     from controller import WorkflowError
     from backends.codex_app_server import RpcError
     config = rpc.call("config/read", {"cwd": str(rpc.c.repo), "includeLayers": False}, timeout=20).get("config", {})
-    provider = provider or config.get("model_provider")
-    providers = rpc.call("modelProvider/list", {}, timeout=20).get("data", [])
+    provider_response = rpc.call("modelProvider/list", {}, timeout=20)
+    provider = provider or config.get("model_provider") or provider_response.get("defaultProviderId")
+    providers = provider_response.get("data", [])
     catalog, seen = [], set()
     cursor = None
     while True:

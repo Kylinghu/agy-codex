@@ -17,7 +17,7 @@ class InboxTests(unittest.TestCase):
         self.addCleanup(self.f.doCleanups)
         self.c = self.f.c
         self.ticket = self.f.f.ticket_id
-        self.f.f.create()
+        self.f.f.create(max_rounds=1)
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self.addCleanup(self.pool.shutdown, wait=True)
         self.addCleanup(self.c.cancel.set)
@@ -53,6 +53,8 @@ class InboxTests(unittest.TestCase):
         self.assertEqual(messages[steered["id"]]["status"], "turn_completed")
         self.assertEqual(messages[steered["id"]]["delivery_action"], "steer")
         self.assertTrue(self.c.packet(self.ticket)["all_tests_passed"])
+        from product import usage
+        self.assertEqual(usage(self.c, state)["codex"], {"input_tokens": 24, "cached_input_tokens": 4, "output_tokens": 16})
 
     def test_only_exact_stale_steer_is_queued(self):
         job = self.run_worker(stale_steer=True)
@@ -89,6 +91,74 @@ class InboxTests(unittest.TestCase):
         records = {m["id"]: m for m in inbox.history(self.c, self.ticket)}
         self.assertEqual(records[msg["id"]]["status"], "deferred")
         self.assertEqual(records[stop["id"]]["status"], "turn_interrupted")
+
+    def test_late_interrupt_preserves_completed_final_round(self):
+        # A late interrupt can be consumed by the final sealed-window drain.
+        original = inbox.drain
+        def drain(*args, **kwargs):
+            queued, _ = original(*args, **kwargs)
+            return queued, True
+        with mock.patch.object(inbox, "drain", side_effect=drain):
+            state = self.c.run(self.ticket)
+        self.assertEqual(state["status"], "ESCALATE", state)
+        self.assertTrue(state["recoverable_interruption"])
+        self.assertEqual(sa.read_json(self.c._round_dir(state)/"summary.json")["exit_code"], 0)
+        recovered = self.c.recover(self.ticket)
+        self.assertEqual(recovered["status"], "REVIEW", recovered)
+        self.assertEqual(recovered["round"], 1)
+        self.assertEqual(len(self.f.calls("turn/start")), 1)
+
+    def test_interrupt_error_before_terminal_notification_pauses_without_replay(self):
+        job = self.run_worker(stale_interrupt=True)
+        self.wait_window()
+        msg = inbox.publish(self.c, self.ticket, "interrupt")
+        state = job.result(timeout=20)
+        self.assertEqual(state["status"], "ESCALATE", state)
+        self.assertTrue(state["recoverable_interruption"])
+        self.assertFalse(state["app_server_pending"])
+        actual = next(m for m in inbox.history(self.c, self.ticket) if m["id"] == msg["id"])
+        self.assertEqual(actual["status"], "deferred")
+        self.assertEqual(sa.read_json(self.c._round_dir(state)/"summary.json")["exit_code"], 0)
+        recovered = self.c.recover(self.ticket)
+        self.assertEqual(recovered["status"], "REVIEW", recovered)
+        self.assertEqual(len(self.f.calls("turn/start")), 1)
+
+    def test_other_interrupt_error_retains_uncertain_submission(self):
+        job = self.run_worker(other_interrupt_error=True)
+        self.wait_window()
+        msg = inbox.publish(self.c, self.ticket, "interrupt")
+        state = job.result(timeout=20)
+        self.assertEqual(state["status"], "ESCALATE", state)
+        self.assertTrue(state["app_server_pending"])
+        actual = next(m for m in inbox.history(self.c, self.ticket) if m["id"] == msg["id"])
+        self.assertEqual(actual["status"], "delivery_unknown")
+        self.assertEqual(len(self.f.calls("turn/start")), 1)
+
+    def test_reconcile_updates_only_matching_accepted_ack(self):
+        self.f.mode(ambiguous=True, not_loaded=True)
+        state = self.c.run(self.ticket)
+        self.assertTrue(state["app_server_pending"])
+        tid = state["active_turn_id"]
+        # Simulate ACKs durably saved before a transport break. Other/unknown
+        # records must not be promoted by this Turn's terminal result.
+        state["status"] = "RUNNING"
+        window = inbox.open_window(self.c, state)
+        messages = [inbox.publish(self.c, self.ticket, "queue", text)
+                    for text in ("accepted", "other turn", "unknown")]
+        for message in messages:
+            inbox.claim(window, window/"pending"/(message["id"]+".json"))
+        inbox.ack(self.c, messages[0], "rpc_accepted", turn_id=tid)
+        inbox.ack(self.c, messages[1], "rpc_accepted", turn_id="different-turn")
+        inbox.seal(self.c, state, window)
+        state["status"] = "ESCALATE"
+        self.c.save(state)
+        recovered = self.c.recover(self.ticket)
+        self.assertEqual(recovered["status"], "REVIEW", recovered)
+        result = {m["id"]: m["status"] for m in self.c.packet(self.ticket)["inbox_messages"]}
+        self.assertEqual(result[messages[0]["id"]], "turn_completed")
+        self.assertEqual(result[messages[1]["id"]], "rpc_accepted")
+        self.assertEqual(result[messages[2]["id"]], "delivery_unknown")
+        self.assertEqual(len(self.f.calls("turn/start")), 1)
 
     def test_supplement_budget_is_finite_per_ticket(self):
         job = self.run_worker(hold_all=True)

@@ -136,6 +136,17 @@ def review_messages(c, ticket_id):
              "queued", "delivery_unknown", "deferred", "rejected")]
 
 
+def finish_accepted(c, ticket_id, turn_id, status):
+    """Only native terminal evidence may advance an already accepted ACK."""
+    terminal = {"completed": "turn_completed", "interrupted": "turn_interrupted",
+                "failed": "turn_failed"}.get(status)
+    if not terminal:
+        return
+    for message in history(c, ticket_id):
+        if message.get("status") == "rpc_accepted" and message.get("turn_id") == turn_id:
+            ack(c, message, terminal, turn_id=turn_id)
+
+
 def recover_window(c, state):
     """A crashed window is never replayed; retain uncertain claims and defer unclaimed input."""
     wid = state.get("inbox_window")
