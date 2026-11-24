@@ -212,7 +212,7 @@ def run(c, state, launcher, requested, directory, prompt, on_line):
         atomic_json(directory/"invocation.json", {"backend": "app-server", "argv": rpc.argv,
                     "cwd": str(c.repo), "started_at": now(), "codex_requested": requested})
         if requested.get("model") or requested.get("model_provider"):
-            catalog = discover(rpc, requested.get("model_provider"))
+            catalog = discover(rpc, requested.get("model_provider"), include_rates=False)
             validate_catalog(requested, catalog["models"])
             atomic_json(directory/"model-catalog.json", catalog)
         params = {"cwd": str(c.repo), "sandbox": "workspace-write", "approvalPolicy": "never"}

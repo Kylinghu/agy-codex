@@ -63,7 +63,7 @@ def validate_catalog(requested, models):
         raise WorkflowError(f"Requested effort {effort} is not in the model catalog.")
 
 
-def discover(rpc, provider=None):
+def discover(rpc, provider=None, *, include_rates=True):
     from controller import WorkflowError
     from backends.codex_app_server import RpcError
     config = rpc.call("config/read", {"cwd": str(rpc.c.repo), "includeLayers": False}, timeout=20).get("config", {})
@@ -83,10 +83,14 @@ def discover(rpc, provider=None):
         if cursor in seen or len(seen) >= 20:
             raise WorkflowError("Model catalog pagination did not terminate.")
         seen.add(cursor)
-    try:
-        rates = rpc.call("account/rateLimits/read", {}, timeout=10)
-    except RpcError:
-        rates = None
+    rates = None
+    if include_rates:
+        from controller import Interrupted
+        try:
+            rates = rpc.call("account/rateLimits/read", {}, timeout=10)
+        except (RpcError, Interrupted):
+            if rpc.c.cancel.is_set():
+                raise
     # Only expose noncredential fields, never native config layers or provider URLs.
     return {"default_model": config.get("model"), "default_provider": provider,
             "default_effort": config.get("model_reasoning_effort"),

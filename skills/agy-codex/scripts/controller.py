@@ -23,7 +23,10 @@ import time
 import uuid
 
 VERSION = "0.1.1"
-# Backend imports must share this module when invoked directly.
+# Support direct and importlib-loaded Controller entry points, including child probes.
+_scripts_dir = str(Path(__file__).resolve().parent)
+if _scripts_dir not in sys.path:
+    sys.path.insert(0, _scripts_dir)
 if __name__ == "__main__":
     sys.modules.setdefault("controller", sys.modules[__name__])
 TERMINAL = {"PASS", "ESCALATE"}
