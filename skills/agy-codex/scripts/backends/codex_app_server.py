@@ -208,6 +208,8 @@ def final_text(turn, fallback=None):
 
 def run(c, state, launcher, requested, directory, prompt, on_line):
     from routing import verify_provider, validate_catalog, discover
+    from backends.usage import RoundUsage
+    usage = RoundUsage(directory)
     with Client(c, launcher, directory, state, requested) as rpc:
         atomic_json(directory/"invocation.json", {"backend": "app-server", "argv": rpc.argv,
                     "cwd": str(c.repo), "started_at": now(), "codex_requested": requested})
@@ -262,6 +264,9 @@ def run(c, state, launcher, requested, directory, prompt, on_line):
                         c.save(state, "turn_bound")
                     if m == "turn/completed":
                         completed[tid] = turn
+                elif m == "thread/tokenUsage/updated" and state.get("app_server_pending"):
+                    if args.get("turnId") and state.get("active_turn_id") in (None, args["turnId"]):
+                        usage.update(args)
                 elif m in ("item/started", "item/completed"):
                     item = args.get("item") or {}
                     typ = item.get("type")
@@ -293,9 +298,9 @@ def run(c, state, launcher, requested, directory, prompt, on_line):
                 text = final_text(turn, texts.get(tid))
                 if isinstance(text, str):
                     (directory/"last-message.md").write_text(text, encoding="utf-8")
-                emit({"type": "turn.completed", "usage": {}})
+                emit({"type": "turn.completed", "usage": usage.data})
                 atomic_json(directory/"summary.json", {"session_id": thread_id, "exit_code": 0,
-                            "completed": True, "failed": False, "invalid_lines": 0, "usage": {}})
+                            "completed": True, "failed": False, "invalid_lines": 0, "usage": usage.data})
             else:
                 emit({"type": "turn.failed", "error": turn.get("error") or turn.get("status")})
             state.update(last_turn_id=tid, last_turn_status=turn.get("status"),
@@ -315,6 +320,17 @@ def reconcile(c, state):
     with Client(c, c.codex_cmd or resolve_codex(), c._round_dir(state)/"recovery",
                 requested={"model_provider": state.get("model_provider")}, timeout=30) as rpc:
         thread = rpc.call("thread/read", {"threadId": state["session_id"], "includeTurns": True}).get("thread") or {}
+        if thread.get("id") == state["session_id"] and (thread.get("status") or {}).get("type") == "notLoaded":
+            params = {"threadId": state["session_id"], "cwd": str(c.repo),
+                      "sandbox": "workspace-write", "approvalPolicy": "never"}
+            if state.get("model_provider"):
+                params["modelProvider"] = state["model_provider"]
+            resumed = rpc.call("thread/resume", params)
+            if (resumed.get("thread") or {}).get("id") != state["session_id"]:
+                raise WorkflowError("Recovery loaded a different Thread.")
+            if state.get("model_provider") and resumed.get("modelProvider") != state["model_provider"]:
+                raise WorkflowError("Recovery loaded a different provider.")
+            thread = rpc.call("thread/read", {"threadId": state["session_id"], "includeTurns": True}).get("thread") or {}
         if thread.get("id") != state["session_id"] or (thread.get("status") or {}).get("type") != "idle":
             raise WorkflowError("Saved App Server Thread is not confirmed idle.")
         turns = thread.get("turns") or []
@@ -329,8 +345,9 @@ def reconcile(c, state):
                 raise WorkflowError("Completed Turn has no recoverable final answer; inspect evidence.")
             directory = c._round_dir(state)
             (directory/"last-message.md").write_text(text, encoding="utf-8")
+            from backends.usage import observed
             atomic_json(directory/"summary.json", {"session_id": state["session_id"], "exit_code": 0,
-                        "completed": True, "failed": False, "invalid_lines": 0, "usage": {}})
+                        "completed": True, "failed": False, "invalid_lines": 0, "usage": observed(directory)})
         state.update(app_server_pending=False, last_turn_id=state["active_turn_id"],
                      last_turn_status=turn["status"], active_turn_id=None)
         c.save(state, "turn_reconciled")

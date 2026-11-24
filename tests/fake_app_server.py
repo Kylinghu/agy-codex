@@ -16,6 +16,7 @@ def main():
     state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
     ledger = root/"fake-app-calls.jsonl"
     pending = None
+    loaded = False
     def emit(value):
         print(json.dumps(value), flush=True)
     def record(request):
@@ -30,7 +31,7 @@ def main():
     def save():
         state_path.write_text(json.dumps(state), encoding="utf-8")
     def thread():
-        return {"id": state.get("id"), "status": {"type": "idle"}, "turns": state.get("turns", [])}
+        return {"id": state.get("id"), "status": {"type": "notLoaded" if mode.get("not_loaded") and not loaded else "idle"}, "turns": state.get("turns", [])}
     def finish(rid, params):
         tid = str(uuid.uuid4())
         report = {"outcome": "done", "summary": "Fixture implementation",
@@ -41,6 +42,10 @@ def main():
         state["turns"].insert(0, turn)
         save()
         notify("turn/started", threadId=state["id"], turn={"id": tid, "status": "inProgress"})
+        total = {"inputTokens": 100 + 12*len(state["turns"]), "cachedInputTokens": 20+2*len(state["turns"]), "outputTokens": 50+8*len(state["turns"])}
+        for _ in range(2):
+            notify("thread/tokenUsage/updated", threadId=state["id"], turnId=tid,
+                   tokenUsage={"total": total, "last": {"inputTokens": 12, "cachedInputTokens": 2, "outputTokens": 8}})
         if mode.get("ambiguous"):
             error(rid, -32603, "ambiguous submission")
             return
@@ -71,7 +76,7 @@ def main():
             response(rid, {"config": {"model": "fixture-model", "model_provider": None,
                                       "model_reasoning_effort": "low", "secret": "NOT_FOR_LOGS"}})
         elif method == "modelProvider/list":
-            response(rid, {"data": [{"id": "openai"}, {"id": "proxy"}]})
+            response(rid, {"data": [{"id": "openai"}, {"id": "proxy"}], "defaultProviderId": "openai"})
         elif method == "model/list":
             response(rid, {"data": [{"id": name, "model": name,
                                     "supportedReasoningEfforts": [{"reasoningEffort": "low"},
@@ -88,6 +93,7 @@ def main():
             elif params.get("threadId") != state.get("id"):
                 error(rid, -32600, "bad thread")
                 continue
+            loaded = True
             response(rid, {"thread": thread(), "model": params.get("model", "fixture-model"),
                             "modelProvider": mode.get("provider", "openai"), "reasoningEffort": "low"})
         elif method == "thread/read":

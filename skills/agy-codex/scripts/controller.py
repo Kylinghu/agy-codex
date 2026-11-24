@@ -655,7 +655,7 @@ class Controller:
                 if requested.get("model_provider") not in (None, prior_provider):
                     raise WorkflowError("Cannot change provider inside an existing Session.")
                 requested["model_provider"] = prior_provider
-            if backend == "exec" and policy(self.root)["allowed_providers"]:
+            if requested.get("model_provider") or (backend == "exec" and policy(self.root)["allowed_providers"]):
                 verify_provider(self.root, requested.get("model_provider"))
             state.update(codex_requested=requested, status="RUNNING", round=state["round"]+1, runner_pid=os.getpid(), reason=None,
                          recoverable_interruption=False, resolution_allowed=False, stop_origin=None)
@@ -707,8 +707,19 @@ class Controller:
                     return self._escalate(state, "Codex execution did not complete cleanly; inspect summary.json and stderr.log.")
                 return self._prepare_review(state)
             except (Exception, KeyboardInterrupt) as exc:
+                # A native Turn can complete and persist its successful summary just
+                # before a pause or cleanup error. Preserve that round for recovery.
+                saved_summary = directory/"summary.json"
+                if (state.get("backend") == "app-server" and not state.get("app_server_pending")
+                        and state.get("last_turn_status") == "completed" and summary.data["completed"]
+                        and not summary.data["failed"] and not summary.data["invalid_lines"]
+                        and summary.data["session_id"] == state["session_id"] and saved_summary.exists()):
+                    done = read_json(saved_summary)
+                    if (done.get("exit_code") == 0 and done.get("completed") and not done.get("failed")
+                            and not done.get("invalid_lines") and done.get("session_id") == state["session_id"]):
+                        summary.data["exit_code"] = 0
                 summary.data["controller_error"] = str(exc) or type(exc).__name__
-                atomic_json(directory / "summary.json", summary.data)
+                atomic_json(saved_summary, summary.data)
                 completed_worker = (summary.data.get("exit_code") == 0 and summary.data["completed"]
                                     and not summary.data["failed"] and not summary.data["invalid_lines"]
                                     and summary.data["session_id"] == state["session_id"])
