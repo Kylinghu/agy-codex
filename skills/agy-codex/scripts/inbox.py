@@ -133,7 +133,17 @@ def review_messages(c, ticket_id):
     # Accepted is a transport fact, not proof the instruction was implemented.
     return [m for m in history(c, ticket_id) if m["status"] in
             ("rpc_accepted", "turn_completed", "turn_interrupted", "turn_failed",
-             "delivery_unknown", "deferred", "rejected")]
+             "queued", "delivery_unknown", "deferred", "rejected")]
+
+
+def recover_window(c, state):
+    """A crashed window is never replayed; retain uncertain claims and defer unclaimed input."""
+    wid = state.get("inbox_window")
+    if not isinstance(wid, str) or not re.fullmatch(r"[0-9a-f]{32}", wid):
+        return
+    directory = root(c, state["id"])/wid
+    drain(c, state, directory, allow_queue=False,
+          reason="Interrupted window closed during recovery; input was not submitted.")
 
 
 def drain(c, state, directory, *, allow_queue, reason):

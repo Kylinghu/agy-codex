@@ -56,7 +56,7 @@ def main():
         if status == "completed":
             report = {"outcome": "done", "summary": "Fixture implementation",
                       "changes": ["value.py"], "checks": [], "issue": None}
-            (Path.cwd()/"value.py").write_text("VALUE = " + str(len(state["turns"])+1) + "\\n", encoding="utf-8")
+            (Path.cwd()/"value.py").write_text("VALUE = " + str(len(state["turns"])+1) + "\n", encoding="utf-8")
             items = [{"type": "agentMessage", "phase": "final_answer", "text": json.dumps(report)}]
         turn = {"id": tid, "status": status, "error": None, "items": items}
         state["turns"].insert(0, turn)

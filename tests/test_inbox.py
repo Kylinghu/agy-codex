@@ -4,8 +4,8 @@ import time
 import unittest
 from unittest import mock
 
-import inbox
 import test_app_server
+import inbox
 
 sa = test_app_server.sa
 

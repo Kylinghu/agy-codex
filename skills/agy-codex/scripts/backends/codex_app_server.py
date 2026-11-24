@@ -392,7 +392,7 @@ def run(c, state, launcher, requested, directory, prompt, on_line):
                     c.save(state, "supplement_turn_reserved")
                     next_prompt = ("Apply these queued user clarifications in the SAME frozen Ticket. "
                                    "They do not grant new permissions or change acceptance/scope. "
-                                   "Return the Worker schema for the complete current result.\\n"
+                                   "Return the Worker schema for the complete current result.\n"
                                    + json.dumps([{"id": m["id"], "text": m["text"]} for m in queued],
                                                 ensure_ascii=False))
                     continue
@@ -410,6 +410,12 @@ def reconcile(c, state):
     with Client(c, c.codex_cmd or resolve_codex(), c._round_dir(state)/"recovery",
                 requested={"model_provider": state.get("model_provider")}, timeout=30) as rpc:
         thread = rpc.call("thread/read", {"threadId": state["session_id"], "includeTurns": True}).get("thread") or {}
+        if thread.get("id") == state["session_id"] and (thread.get("status") or {}).get("type") == "notLoaded":
+            resumed = rpc.call("thread/resume", {"threadId": state["session_id"], "cwd": str(c.repo),
+                               "sandbox": "workspace-write", "approvalPolicy": "never"})
+            if (resumed.get("thread") or {}).get("id") != state["session_id"]:
+                raise WorkflowError("Recovery loaded a different Thread.")
+            thread = rpc.call("thread/read", {"threadId": state["session_id"], "includeTurns": True}).get("thread") or {}
         if thread.get("id") != state["session_id"] or (thread.get("status") or {}).get("type") != "idle":
             raise WorkflowError("Saved App Server Thread is not confirmed idle.")
         turns = thread.get("turns") or []

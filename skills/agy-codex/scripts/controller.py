@@ -1009,6 +1009,9 @@ class Controller:
             if state.get("app_server_pending"):
                 from backends.codex_app_server import reconcile
                 reconcile(self, state)
+            if state.get("inbox_window"):
+                from inbox import recover_window
+                recover_window(self, state)
             summary = EventSummary()
             log = self._round_dir(state)/"codex.jsonl"
             if log.exists():
