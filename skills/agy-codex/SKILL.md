@@ -32,6 +32,12 @@ identical start is idempotent. A fresh goal does not reuse an unrelated Session.
 
 ## Execute
 
+For automatic Codex model selection, consult the configured tier mapping and a
+single read-only `user_cli.py --repo <workspace> models --json` discovery. Gemini
+chooses among user-configured tiers, considering quota as a soft constraint;
+never choose arbitrary models from a mixed catalog. Honor manual requests and
+keep the existing Session. No model selection step is needed for status.
+
 Read `references/host.md` for the internal call contract. Pass explicitly requested Codex model and reasoning depth in the optional `codex` workflow object; preserve saved settings on ordinary continue. Do not modify Codex's global config. Invoke AGY's existing
 `/run-workflow` capability with saved `scripts/agy_workflow.py`; do not regenerate
 it or ask the user to author JSON, supply IDs, or copy handoff prompts. This is a

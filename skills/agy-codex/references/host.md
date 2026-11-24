@@ -206,3 +206,16 @@ acceptance or create another Ticket simply to upgrade the Worker. Per-task
 settings; do not invent model IDs or unsupported efforts. These are requested
 settings, not a server-verified model identity. No changes to CODEX_HOME or
 Codex Desktop defaults are needed.
+
+## Model catalog and backend selection
+
+For a task needing model selection, run `PYTHON SKILL_DIR/scripts/user_cli.py
+--repo REPO models --json` once. Use the returned routing configuration and
+rate-window facts; do not treat the catalog as entitlement or infer price from
+model names. Choose a configured tier only (optional top-level `tier`); never
+automatically route to an unconfigured intermediary or a Gemini model exposed
+by another Codex provider. Honor explicit user model/effort/provider requests.
+The existing task/plan `codex` object may include `model_provider`.
+When continuing a Ticket, an explicit tier/override applies only to that Ticket.
+If discovery is unavailable, report that and retain known configured defaults
+instead of inventing quota. Do not repeatedly poll.

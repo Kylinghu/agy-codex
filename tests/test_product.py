@@ -76,7 +76,22 @@ class ProductTests(unittest.TestCase):
         self.assertIn("## Spec", self.prompts[0])
         self.assertIn("## Standards", self.prompts[0])
         self.assertEqual(self.factories[0]["type_name"], "research")
-        self.assertNotIn("session_id", result)
+        self.assertEqual(result["session_id"], self.c.load(result["ticket_id"])["session_id"])
+        self.assertTrue(result["session_id"])
+
+    def test_null_continue_tier_keeps_saved_model(self):
+        test_protocol.sa.atomic_json(self.f.global_config, {"routing": {"tiers": {
+            "standard": {"model": "std-model", "reasoning_effort": "low"}}}})
+        self.f.create(codex={"model": "heavy-model", "reasoning_effort": "high"})
+        first = self.c.run(self.f.ticket_id)
+        self.assertEqual(first["status"], "REVIEW", first)
+        self.c.verdict(self.f.ticket_id, self.f.review("REVISE"), source="test")
+        result = self.call({"action": "continue", "ticket": self.f.ticket_id, "tier": None})
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["codex_requested"], {"model": "heavy-model", "reasoning_effort": "high"})
+        args = self.f.calls()[1]["argv"]
+        self.assertEqual(args[args.index("-m")+1], "heavy-model")
+        self.assertEqual(args[args.index("-c")+1], 'model_reasoning_effort="high"')
 
     def test_identical_start_is_idempotent_and_does_not_repeat_worker_or_review(self):
         first = self.call({"action": "start", "task": self.task})

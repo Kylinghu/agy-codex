@@ -17,6 +17,8 @@ def main(argv=None):
     status = commands.add_parser("status")
     status.add_argument("--ticket")
     status.add_argument("--json", action="store_true")
+    models = commands.add_parser("models")
+    models.add_argument("--json", action="store_true")
     checks = commands.add_parser("doctor")
     checks.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
@@ -36,6 +38,10 @@ def main(argv=None):
                 print("真实执行与会话恢复需由独立 smoke probe 验证。")
             return 0 if result["static_checks_passed"] else 2
         c = Controller(args.repo)
+        if args.action == "models":
+            from routing import probe
+            print(json.dumps(probe(c), ensure_ascii=False, indent=2))
+            return 0
         ticket_id = active_id(c, args.ticket)
         plan = load_plan(c) if args.ticket is None else None
         result = plan_report(c, plan) if plan else report(c, c.load(ticket_id) if ticket_id else None)

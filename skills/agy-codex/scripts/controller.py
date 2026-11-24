@@ -23,6 +23,12 @@ import time
 import uuid
 
 VERSION = "0.1.1"
+# Support direct and importlib-loaded Controller entry points, including child probes.
+_scripts_dir = str(Path(__file__).resolve().parent)
+if _scripts_dir not in sys.path:
+    sys.path.insert(0, _scripts_dir)
+if __name__ == "__main__":
+    sys.modules.setdefault("controller", sys.modules[__name__])
 TERMINAL = {"PASS", "ESCALATE"}
 ISSUE_FIELDS = ("kind", "detail", "evidence", "question", "recommendation")
 WORKER_SCHEMA = {
@@ -315,10 +321,10 @@ def codex_settings(*layers):
     for layer in layers:
         if layer is None:
             continue
-        if not isinstance(layer, dict) or set(layer) - {"model", "reasoning_effort"}:
-            raise WorkflowError("codex must contain only model and/or reasoning_effort.")
+        if not isinstance(layer, dict) or set(layer) - {"model", "reasoning_effort", "model_provider"}:
+            raise WorkflowError("codex must contain only model, reasoning_effort and/or model_provider.")
         for key, value in layer.items():
-            pattern = r"[A-Za-z0-9][A-Za-z0-9._:/+\-]*" if key == "model" else r"[a-z][a-z0-9_\-]*"
+            pattern = r"[A-Za-z0-9][A-Za-z0-9._:/+\-]*" if key in ("model", "model_provider") else r"[a-z][a-z0-9_\-]*"
             if not isinstance(value, str) or not re.fullmatch(pattern, value):
                 raise WorkflowError(f"Invalid codex {key}: expected a nonempty identifier.")
             result[key] = value
@@ -327,19 +333,9 @@ def codex_settings(*layers):
 
 def configured_codex(root):
     """Read optional plugin defaults; project metadata overrides global defaults."""
-    global_path = Path(os.environ.get("AGY_CODEX_CONFIG", str(Path.home() / ".gemini" / "config" / "agy-codex" / "config.json"))).expanduser()
-    result = {}
-    for path in (global_path, root / "config.json"):
-        try:
-            value = read_json(path)
-        except FileNotFoundError:
-            continue
-        except (OSError, ValueError) as exc:
-            raise WorkflowError(f"Cannot read AGY Codex configuration {path}: {exc}") from exc
-        if not isinstance(value, dict):
-            raise WorkflowError(f"AGY Codex configuration must be a JSON object: {path}")
-        result = codex_settings(result, value.get("codex"))
-    return result
+    from config import load
+    from routing import select
+    return codex_settings(select(root), load(root)["codex"])
 
 
 def codex_exec_flags(settings):
@@ -349,6 +345,8 @@ def codex_exec_flags(settings):
         flags += ["-m", settings["model"]]
     if "reasoning_effort" in settings:
         flags += ["-c", "model_reasoning_effort=" + json.dumps(settings["reasoning_effort"])]
+    if "model_provider" in settings:
+        flags += ["-c", "model_provider=" + json.dumps(settings["model_provider"])]
     return flags
 
 
@@ -647,6 +645,18 @@ class Controller:
             if saved is None:  # Older Tickets inherit defaults once on their next run.
                 saved = codex_settings(configured_codex(self.root), state["spec"].get("codex"))
             requested = codex_settings(saved, codex)
+            from config import load
+            from routing import policy, verify_provider
+            backend = load(self.root).get("backend", "exec" if self.codex_cmd else "auto")
+            prior_provider = state.get("model_provider") or (saved.get("model_provider") if state.get("session_id") else None)
+            if state.get("app_server_pending"):
+                raise WorkflowError("Reconcile the pending App Server Turn before another worker call.")
+            if prior_provider:
+                if requested.get("model_provider") not in (None, prior_provider):
+                    raise WorkflowError("Cannot change provider inside an existing Session.")
+                requested["model_provider"] = prior_provider
+            if requested.get("model_provider") or (backend == "exec" and policy(self.root)["allowed_providers"]):
+                verify_provider(self.root, requested.get("model_provider"))
             state.update(codex_requested=requested, status="RUNNING", round=state["round"]+1, runner_pid=os.getpid(), reason=None,
                          recoverable_interruption=False, resolution_allowed=False, stop_origin=None)
             directory = self._round_dir(state)
@@ -657,16 +667,6 @@ class Controller:
             prompt = self._prompt(state)
             (directory / "prompt.txt").write_text(prompt, encoding="utf-8")
             atomic_json(directory/"worker-schema.json", WORKER_SCHEMA)
-            # Global flags work for both exec and exec resume; resume lacks its own --sandbox.
-            argv = [*launcher, "-a", "never", "-s", "workspace-write", "exec"]
-            if state["session_id"]:
-                argv += ["resume"]
-            argv += codex_exec_flags(requested)
-            argv += ["--json", "-o", str(directory/"last-message.md"), "--output-schema", str(directory/"worker-schema.json")]
-            if state["session_id"]:
-                argv += [state["session_id"]]
-            argv += ["-"]
-            atomic_json(directory / "invocation.json", {"argv": argv, "cwd": str(self.repo), "started_at": now(), "codex_requested": requested})
             summary = EventSummary()
             def on_line(raw):
                 event = summary.feed(raw)
@@ -686,7 +686,20 @@ class Controller:
                         self._progress("files", paths=[change.get("path", "") for change in item.get("changes", [])])
             try:
                 self._progress("stage", stage="worker", round=state["round"])
-                rc = self._process(state, argv, prompt, directory/"codex.jsonl", directory/"stderr.log", on_line)
+                from backends import codex_exec, codex_app_server
+                if backend == "exec":
+                    rc = codex_exec.run(self, state, launcher, requested, directory, prompt, on_line)
+                else:
+                    try:
+                        rc = codex_app_server.run(self, state, launcher, requested, directory, prompt, on_line)
+                    except codex_app_server.StartupUnavailable as exc:
+                        if backend != "auto" or state.get("app_server_pending"):
+                            raise
+                        if policy(self.root)["allowed_providers"]:
+                            verify_provider(self.root, requested.get("model_provider"))
+                        atomic_json(directory/"backend-fallback.json", {"reason": str(exc),
+                                    "from": "app-server", "to": "exec", "before_turn": True})
+                        rc = codex_exec.run(self, state, launcher, requested, directory, prompt, on_line)
                 summary.data["exit_code"] = rc
                 atomic_json(directory / "summary.json", summary.data)
                 if (rc or not summary.data["completed"] or summary.data["failed"] or summary.data["invalid_lines"]
@@ -694,12 +707,23 @@ class Controller:
                     return self._escalate(state, "Codex execution did not complete cleanly; inspect summary.json and stderr.log.")
                 return self._prepare_review(state)
             except (Exception, KeyboardInterrupt) as exc:
+                # A native Turn can complete and persist its successful summary just
+                # before a pause or cleanup error. Preserve that round for recovery.
+                saved_summary = directory/"summary.json"
+                if (state.get("backend") == "app-server" and not state.get("app_server_pending")
+                        and state.get("last_turn_status") == "completed" and summary.data["completed"]
+                        and not summary.data["failed"] and not summary.data["invalid_lines"]
+                        and summary.data["session_id"] == state["session_id"] and saved_summary.exists()):
+                    done = read_json(saved_summary)
+                    if (done.get("exit_code") == 0 and done.get("completed") and not done.get("failed")
+                            and not done.get("invalid_lines") and done.get("session_id") == state["session_id"]):
+                        summary.data["exit_code"] = 0
                 summary.data["controller_error"] = str(exc) or type(exc).__name__
-                atomic_json(directory / "summary.json", summary.data)
+                atomic_json(saved_summary, summary.data)
                 completed_worker = (summary.data.get("exit_code") == 0 and summary.data["completed"]
                                     and not summary.data["failed"] and not summary.data["invalid_lines"]
                                     and summary.data["session_id"] == state["session_id"])
-                recoverable = bool(state["session_id"]) and (isinstance(exc, (Interrupted, KeyboardInterrupt)) or completed_worker)
+                recoverable = bool(state["session_id"]) and (isinstance(exc, (Interrupted, KeyboardInterrupt)) or completed_worker or state.get("app_server_pending"))
                 return self._escalate(state, summary.data["controller_error"], recoverable=recoverable)
 
     def _changed(self, snapshot, baseline):
@@ -991,6 +1015,9 @@ class Controller:
                 raise WorkflowError("The saved worker/process group is still alive. No replacement was started.")
             if state.get("runner_pid") != os.getpid() and pid_alive(state.get("runner_pid")):
                 raise WorkflowError("The saved controller process is still alive. No replacement was started.")
+            if state.get("app_server_pending"):
+                from backends.codex_app_server import reconcile
+                reconcile(self, state)
             summary = EventSummary()
             log = self._round_dir(state)/"codex.jsonl"
             if log.exists():

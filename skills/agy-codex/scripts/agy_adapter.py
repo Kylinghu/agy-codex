@@ -156,6 +156,9 @@ async def run_workflow(*, agent_fn, phase_fn, log_fn, workflow_args, workspaces=
         raise WorkflowError("A new contract must use start; continue cannot silently replace the current task or plan.")
     repo = options.get("repo") or (workspaces[0] if workspaces else str(Path.cwd()))
     c = controller or Controller(repo, timeout=int(options.get("timeout", 900)))
+    if options.get("tier") is not None:
+        from routing import select
+        options["codex"] = codex_settings(select(c.root, options["tier"]), options.get("codex"))
     if action == "status":
         plan = plans.load_plan(c, options.get("plan_id")) if not options.get("ticket") else None
         ticket_id = active_id(c, options.get("ticket"))
