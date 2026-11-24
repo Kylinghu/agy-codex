@@ -183,5 +183,51 @@ exec resume, and records the requested values in each invocation. It does not
 edit Codex configuration or change CODEX_HOME, and does not claim to verify the
 actual served model or isolate account usage limits.
 
-This increment does not implement App Server, automatic routing, provider
-verification or Inbox. Those require a separate live protocol validation.
+The App Server adapter below adds native protocol discovery and execution. Its integrated host behavior must still be tested on the target computer.
+
+## App Server backend (v0.2 development)
+
+The existing JSON configuration may specify `"backend": "auto"` (default for
+native CLI: App Server first; exec only on pre-thread initialization failure),
+`"app-server"` (no fallback) or `"exec"` (compatibility mode).
+A model/effort override is still local to the Ticket. The optional
+`codex.model_provider` explicitly selects a native Codex provider and is pinned
+on subsequent calls once known. A provider ID is not a service identity proof.
+
+Example plugin-only configuration:
+
+```json
+{
+  "backend": "auto",
+  "codex": {"model_provider": "openai"},
+  "routing": {
+    "strategy": "auto",
+    "default_tier": "standard",
+    "allowed_providers": ["openai"],
+    "allow_upgrade": true,
+    "tiers": {
+      "economy": {"model": "gpt-6-luna", "reasoning_effort": "low"},
+      "standard": {"model": "gpt-6-luna", "reasoning_effort": "high"},
+      "heavy": {"model": "gpt-6.2-sol", "reasoning_effort": "xhigh"}
+    }
+  }
+}
+```
+
+Use exact IDs supported by your own CLI. Router reads `user_cli.py --repo REPO
+models --json` once when choosing a tier. This invokes only discovery RPCs, not
+model inference, and reports catalog capabilities and available rate windows.
+A catalog is not proof of entitlement or actual cost. Gemini chooses among
+configured tiers; no guessed cost or hard-coded automatic upgrades.
+`economy` and `quality` select their named default tiers unless overridden;
+`manual` uses explicit settings/native defaults. `allow_upgrade` is a Router
+policy preference. Explicit workflow `tier` maps to a configured tier, then
+explicit `codex` fields win. No native Codex settings are edited.
+
+Both backends retain the existing validation and review pipeline. App Server is
+an owned per-round stdio child, never a daemon. A durable submission marker is
+written before turn/start. An ambiguous Turn is reconciled via native Thread
+history before another call; a missing Turn ID or unconfirmed outcome requires
+inspection rather than a duplicate execution. Raw RPC notifications are stored
+locally; only selected discovery fields are retained. Test with CLI 0.171.0 or
+a compatible v2 schema before adopting another version.

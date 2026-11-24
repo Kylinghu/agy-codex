@@ -47,6 +47,7 @@ class Client:
     def __enter__(self):
         self.directory.mkdir(parents=True, exist_ok=True)
         self.err = (self.directory/"app-server.stderr.log").open("wb")
+        initializing = False
         try:
             from controller import __file__ as controller_file
             gated = os.name == "nt"
@@ -64,12 +65,13 @@ class Client:
             self.reader = threading.Thread(target=self._read, daemon=True)
             self.writer = threading.Thread(target=self._write, args=(gated,), daemon=True)
             self.reader.start(); self.writer.start()
+            initializing = True
             self.call("initialize", {"clientInfo": {"name": "agy-codex", "version": "0.2.0"}}, timeout=20)
             self.send({"method": "initialized", "params": {}})
             return self
         except (Exception, KeyboardInterrupt) as exc:
             self.close()
-            if isinstance(exc, (Interrupted, KeyboardInterrupt)):
+            if isinstance(exc, (Interrupted, KeyboardInterrupt)) or (self.p is not None and not initializing):
                 raise
             raise StartupUnavailable(str(exc)) from exc
 
@@ -228,6 +230,10 @@ def run(c, state, launcher, requested, directory, prompt, on_line):
             raise WorkflowError("App Server returned no Thread ID.")
         if state["session_id"] and state["session_id"] != thread_id:
             raise WorkflowError("Resumed App Server returned a different Session ID.")
+        if state["session_id"] and (thread.get("status") or {}).get("type") != "idle":
+            idle = rpc.call("thread/read", {"threadId": thread_id, "includeTurns": False}).get("thread") or {}
+            if (idle.get("status") or {}).get("type") != "idle":
+                raise WorkflowError("Resumed Thread is not confirmed idle.")
         provider = result.get("modelProvider")
         if requested.get("model_provider") and provider != requested["model_provider"]:
             raise WorkflowError("App Server Thread provider differs from requested provider.")

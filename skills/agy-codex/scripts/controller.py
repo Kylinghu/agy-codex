@@ -645,7 +645,7 @@ class Controller:
             from config import load
             from routing import policy, verify_provider
             backend = load(self.root).get("backend", "exec" if self.codex_cmd else "auto")
-            prior_provider = state.get("model_provider")
+            prior_provider = state.get("model_provider") or (saved.get("model_provider") if state.get("session_id") else None)
             if state.get("app_server_pending"):
                 raise WorkflowError("Reconcile the pending App Server Turn before another worker call.")
             if prior_provider:
