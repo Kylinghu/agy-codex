@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import time
 import uuid
 
 from controller import WorkflowError, _metadata_io, atomic_json, now, read_json
@@ -50,7 +51,7 @@ def publish(c, ticket_id, action, text=""):
         raise WorkflowError("The Turn inbox has closed; no message was submitted.")
     mid = uuid.uuid4().hex
     message = {"id": mid, "ticket_id": ticket_id, "round": state["round"], "window": wid,
-               "action": action, "text": text.strip(), "created_at": now()}
+               "action": action, "text": text.strip(), "created_at": now(), "created_ns": time.time_ns()}
     # Temporary file is OUTSIDE pending. Never recreate a sealed pending directory.
     fd, temp = tempfile.mkstemp(prefix="publish-", dir=directory)
     try:
@@ -85,7 +86,7 @@ def records(directory, name):
         except FileNotFoundError:  # Reader raced an atomic claim/seal.
             continue
         result.append((path, message))
-    return sorted(result, key=lambda pair: (pair[1].get("created_at", ""), pair[1].get("id", "")))
+    return sorted(result, key=lambda pair: (pair[1].get("created_ns", 0), pair[1].get("id", "")))
 
 
 def claim(directory, path):
@@ -125,7 +126,7 @@ def history(c, ticket_id):
                 if message.get("ticket_id") != ticket_id or not message.get("id"):
                     continue
                 result[message["id"]] = dict(message, status=status or message.get("status"))
-    return sorted(result.values(), key=lambda m: (m.get("created_at", ""), m["id"]))
+    return sorted(result.values(), key=lambda m: (m.get("created_ns", 0), m["id"]))
 
 
 def review_messages(c, ticket_id):
@@ -139,15 +140,21 @@ def drain(c, state, directory, *, allow_queue, reason):
     """Seal the active window and claim its final batch exactly once."""
     seal(c, state, directory)
     queued = []
+    late_interrupt = False
     for path, _ in records(directory, "sealed"):
         message = claim(directory, path)
         if message is None:
             continue
         action = message.get("delivery_action", message["action"])
         if action == "interrupt":
-            ack(c, message, "deferred", reason="Turn already ended before interrupt delivery.")
+            late_interrupt = True
+            ack(c, message, "deferred", reason="Turn already ended; pause before further work.")
         elif allow_queue and len(queued) < MAX_MESSAGES_PER_WINDOW:
             queued.append(message)
         else:
             ack(c, message, "deferred", reason=reason)
-    return queued
+    if late_interrupt:
+        for message in queued:
+            ack(c, message, "deferred", reason="User interrupted before the supplement Turn.")
+        queued = []
+    return queued, late_interrupt

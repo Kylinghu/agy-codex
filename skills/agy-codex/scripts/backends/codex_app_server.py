@@ -358,8 +358,9 @@ def run(c, state, launcher, requested, directory, prompt, on_line):
                                   turn_id=tid)
                     allow_queue = (status == "completed" and not interrupt_requested and
                                    state.get("queue_turns", 0) < inbox.MAX_QUEUE_TURNS)
-                    queued = inbox.drain(c, state, window, allow_queue=allow_queue,
+                    queued, late_interrupt = inbox.drain(c, state, window, allow_queue=allow_queue,
                                         reason="Turn interrupted/failed or supplement Turn budget reached; submit a new scoped task if needed.")
+                    interrupt_requested = interrupt_requested or late_interrupt
                 except BaseException:
                     # Preserve accepted/unknown delivery records. No automatic resend.
                     inbox.drain(c, state, window, allow_queue=False,
@@ -374,6 +375,11 @@ def run(c, state, launcher, requested, directory, prompt, on_line):
                         (directory/"last-message.md").unlink()
                 else:
                     emit({"type": "turn.failed", "error": turn.get("error") or status})
+                # A final completed Turn must be durable before clearing its submission marker.
+                if status == "completed" and not queued:
+                    emit({"type": "turn.completed", "usage": {}})
+                    atomic_json(directory/"summary.json", {"session_id": thread_id, "exit_code": 0,
+                                "completed": True, "failed": False, "invalid_lines": 0, "usage": {}})
                 state.update(last_turn_id=tid, last_turn_status=status,
                              app_server_pending=False, active_turn_id=None)
                 c.save(state, "turn_terminal")
@@ -390,9 +396,6 @@ def run(c, state, launcher, requested, directory, prompt, on_line):
                                    + json.dumps([{"id": m["id"], "text": m["text"]} for m in queued],
                                                 ensure_ascii=False))
                     continue
-                emit({"type": "turn.completed", "usage": {}})
-                atomic_json(directory/"summary.json", {"session_id": thread_id, "exit_code": 0,
-                            "completed": True, "failed": False, "invalid_lines": 0, "usage": {}})
                 if interrupt_requested:
                     raise Interrupted("Interrupt arrived as Turn completed; task paused before independent review.")
                 return 0

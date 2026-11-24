@@ -16,6 +16,7 @@ def main():
     state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
     ledger = root/"fake-app-calls.jsonl"
     pending = None
+    active = None
     def emit(value):
         print(json.dumps(value), flush=True)
     def record(request):
@@ -47,6 +48,20 @@ def main():
         response(rid, {"turn": {"id": tid, "status": "inProgress"}})
         notify("item/completed", threadId=state["id"], turnId=tid, item={
             "type": "fileChange", "changes": [{"path": "value.py", "kind": "update"}]})
+        notify("turn/completed", threadId=state["id"], turn=turn)
+    def finish_active(status="completed"):
+        nonlocal active
+        tid = active
+        items = []
+        if status == "completed":
+            report = {"outcome": "done", "summary": "Fixture implementation",
+                      "changes": ["value.py"], "checks": [], "issue": None}
+            (Path.cwd()/"value.py").write_text("VALUE = " + str(len(state["turns"])+1) + "\\n", encoding="utf-8")
+            items = [{"type": "agentMessage", "phase": "final_answer", "text": json.dumps(report)}]
+        turn = {"id": tid, "status": status, "error": None, "items": items}
+        state["turns"].insert(0, turn)
+        save()
+        active = None
         notify("turn/completed", threadId=state["id"], turn=turn)
     for line in sys.stdin:
         msg = json.loads(line)
@@ -97,12 +112,34 @@ def main():
         elif method == "turn/start":
             if params.get("threadId") != state.get("id") or not params.get("outputSchema"):
                 return 64
-            if mode.get("approval"):
+            if mode.get("hold") and (not state["turns"] or mode.get("hold_all")):
+                active = str(uuid.uuid4())
+                notify("turn/started", threadId=state["id"], turn={"id": active, "status": "inProgress"})
+                response(rid, {"turn": {"id": active, "status": "inProgress"}})
+            elif mode.get("approval"):
                 pending = (rid, params)
                 emit({"id": "server-approval", "method": "item/commandExecution/requestApproval",
                       "params": {"threadId": state["id"]}})
             else:
                 finish(rid, params)
+        elif method == "turn/steer":
+            if not active or params.get("expectedTurnId") != active:
+                error(rid, -32600, "no active turn to steer")
+            elif mode.get("stale_steer"):
+                finish_active()
+                error(rid, -32600, "no active turn to steer")
+            elif mode.get("other_steer_error"):
+                error(rid, -32600, "invalid input")
+                finish_active()
+            else:
+                response(rid, {"turnId": active})
+                finish_active()
+        elif method == "turn/interrupt":
+            if active and params.get("turnId") == active:
+                response(rid, {})
+                finish_active("interrupted")
+            else:
+                error(rid, -32600, "no active turn")
         else:
             error(rid, -32601, "unsupported fixture request")
     return 0
