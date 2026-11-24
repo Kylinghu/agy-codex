@@ -7,6 +7,13 @@ model: inherit
 commandExecutionPolicy: sandbox
 inheritMcp: true
 inheritCustomizations: true
+tools:
+  - read_file
+  - run_command
+  - manage_task
+  - run_workflow
+  - search_web
+  - ask_question
 skills:
   - skills/agy-codex
 ---
