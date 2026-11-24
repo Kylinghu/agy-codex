@@ -167,6 +167,70 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(record["codex_requested"], second["codex_requested"])
         self.assertEqual(product.report(self.controller, second)["codex_requested"], second["codex_requested"])
 
+    def test_windows_metadata_read_retries_transient_permission_error(self):
+        path = self.global_config
+        with mock.patch.object(sa.sys, "platform", "win32"), \
+                mock.patch.object(sa.time, "sleep") as sleep, \
+                mock.patch.object(Path, "read_text", side_effect=[
+                    PermissionError(13, "sharing violation"), '{"value": 1}']) as read:
+            self.assertEqual(sa.read_json(path), {"value": 1})
+        self.assertEqual(read.call_count, 2)
+        sleep.assert_called_once_with(0.01)
+
+    def test_windows_metadata_replace_retries_without_losing_atomicity(self):
+        path = self.global_config
+        sa.atomic_json(path, {"value": "old"})
+        original_replace = os.replace
+        attempts = []
+        def replace(source, destination):
+            attempts.append(source)
+            self.assertEqual(sa.read_json(destination), {"value": "old"})
+            self.assertEqual(sa.read_json(source), {"value": "new"})
+            if len(attempts) == 1:
+                raise PermissionError(13, "sharing violation")
+            return original_replace(source, destination)
+        with mock.patch.object(sa.sys, "platform", "win32"), \
+                mock.patch.object(sa.time, "sleep") as sleep, \
+                mock.patch.object(sa.os, "replace", side_effect=replace):
+            sa.atomic_json(path, {"value": "new"})
+        self.assertEqual(attempts, [attempts[0]] * 2)
+        self.assertEqual(sa.read_json(path), {"value": "new"})
+        sleep.assert_called_once_with(0.01)
+        self.assertFalse(Path(attempts[0]).exists())
+
+    def test_windows_metadata_permanent_failure_is_bounded_and_preserves_old_file(self):
+        path = self.global_config
+        sa.atomic_json(path, {"value": "old"})
+        with mock.patch.object(sa.sys, "platform", "win32"), \
+                mock.patch.object(sa.time, "sleep") as sleep, \
+                mock.patch.object(sa.os, "replace", side_effect=PermissionError(13, "denied")) as replace:
+            with self.assertRaises(PermissionError):
+                sa.atomic_json(path, {"value": "new"})
+        self.assertEqual(replace.call_count, 6)
+        self.assertEqual(sleep.call_count, 5)
+        self.assertEqual(sa.read_json(path), {"value": "old"})
+        self.assertEqual(list(path.parent.glob(path.name + ".*")), [])
+
+    def test_metadata_read_does_not_retry_parse_missing_or_posix_permission_errors(self):
+        path = self.global_config
+        for platform, error in (("win32", FileNotFoundError(2, "missing")),
+                                ("linux", PermissionError(13, "denied"))):
+            with self.subTest(platform=platform, error=error), \
+                    mock.patch.object(sa.sys, "platform", platform), \
+                    mock.patch.object(sa.time, "sleep") as sleep, \
+                    mock.patch.object(Path, "read_text", side_effect=error) as read:
+                with self.assertRaises(type(error)):
+                    sa.read_json(path)
+                self.assertEqual(read.call_count, 1)
+                sleep.assert_not_called()
+        with mock.patch.object(sa.sys, "platform", "win32"), \
+                mock.patch.object(sa.time, "sleep") as sleep, \
+                mock.patch.object(Path, "read_text", return_value="{invalid") as read:
+            with self.assertRaises(json.JSONDecodeError):
+                sa.read_json(path)
+            self.assertEqual(read.call_count, 1)
+            sleep.assert_not_called()
+
     def test_invalid_model_override_does_not_consume_round(self):
         self.create()
         with self.assertRaises(sa.WorkflowError):

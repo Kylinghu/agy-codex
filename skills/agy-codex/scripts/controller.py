@@ -83,6 +83,23 @@ def encode(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
 
 
+def _metadata_io(operation):
+    """Bounded retry for transient Windows sharing failures during publication.
+
+    Windows readers can briefly reject open/replace while another handle holds
+    the file. Keep the atomic rename protocol; never retry JSON parse errors,
+    missing files, unrelated I/O failures, or POSIX permission errors.
+    """
+    for delay in (0.01, 0.02, 0.04, 0.08, 0.16, None):
+        try:
+            return operation()
+        except PermissionError as exc:
+            if (sys.platform != "win32" or delay is None
+                    or getattr(exc, "winerror", None) not in (None, 5, 32, 33)):
+                raise
+            time.sleep(delay)
+
+
 def atomic_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -90,14 +107,15 @@ def atomic_json(path, value):
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
             f.write(encode(value)); f.flush(); os.fsync(f.fileno())
-        os.replace(name, path)
+        _metadata_io(lambda: os.replace(name, path))
     finally:
         if os.path.exists(name):
             os.unlink(name)
 
 
 def read_json(path):
-    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    path = Path(path)
+    return json.loads(_metadata_io(lambda: path.read_text(encoding="utf-8-sig")))
 
 
 def git(repo, *args, allowed=(0,)):
