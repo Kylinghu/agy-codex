@@ -5,7 +5,10 @@ from Matt Pocock's code-review. Use one isolated read-only reviewer for both axe
 
 **Cognitive independence order**: inspect the original goal, acceptance criteria,
 `diff_path`, relevant changed files, and independent test results **first** and
-form your own judgment before reading `worker_report` or `last_message_path`. Do
+form your own judgment before reading `worker_report_path`, `last_message_path`,
+or any inline `worker_report`. On normal `done` reviews, `worker_report` is
+intentionally omitted from the initial packet and supplied only as
+`worker_report_path` so you can read it via `read_file` afterward if needed. Do
 not inherit the Worker's conclusions or self-report as proof.
 
 ## Spec

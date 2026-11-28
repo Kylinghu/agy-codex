@@ -77,7 +77,13 @@ Both `--cwd` and `--repo` are accepted across all commands (Git and non-Git work
 
 ## 4. Models, Domain Tools & Verification Honesty
 
-- Pick a tier sufficient for the task (`--tier economy|standard|heavy` or explicit `--model` / `--effort`); do not default to `heavy` for routine edits or mechanical formatting. Query `user_cli.py models --json` only when needed, honor explicit user requests and `allowed_providers`, and never edit Codex global config.
+- **Choose model/effort tier by real task difficulty (do not over-optimize for `economy`)**:
+  - Simple, explicit, mechanical edits → `economy`
+  - Ordinary feature work or non-trivial bug fixes → `standard`
+  - Multi-module refactors or complex technical decisions → `standard` or `heavy`
+  - High-stakes independent audits or hard root-cause investigations → `heavy`
+  - If a low tier hits a false blocker or clear capability shortfall, push back on the **same Thread** (`--resume`) and upgrade the tier instead of retrying blindly.
+  - Query `user_cli.py models --json` only when needed (cached with TTL; `--refresh` forces live RPC), honor explicit user requests and `allowed_providers`, and never edit Codex global config.
 - Reuse project `AGENTS.md`, domain Skills (HWB, Office, etc.), and MCP tools. When a task specifically depends on Office libraries (`python-docx`, `openpyxl`, etc.), probe once upfront rather than building a global startup gate or letting Codex hand-roll fragile OOXML.
 - Office COM restrictions (such as `0x80080005`) have been observed under Windows sandboxes; if actually encountered, do not blindly retry COM loops or auto-escalate permissions. Separate artifact defects, validation failures, and validation environment limits.
 - `status: "completed"` means the Codex Turn ended, not that the user's objective or checks passed. Verify proportionately, continue autonomously if authorized work remains, and report measured Codex usage separately from unavailable AGY usage.

@@ -1,35 +1,38 @@
-# AGY Codex
+# AGY Codex (v0.3.0)
 
-**在 Google Antigravity 中与 Gemini 自然协作，由 OpenAI Codex CLI 承担代码实施。**
+**面向 Google Antigravity 的统一双模型 Agent：Gemini 负责意图理解与任务推进，OpenAI Codex CLI 承担自主工程实施。**
 
-AGY Codex 是一个 **Antigravity 原生插件 + 可选主 Agent**：Gemini 负责需求理解、任务边界切分、常规工程裁决与只读双轴代码审查；Codex CLI 作为唯一的工作区写入者，在持久化的精确 Session 上实施与增量返修。零额外依赖（仅 Python 标准库），无需 MCP 服务、数据库或后台守护进程。
+AGY Codex 是一个 **Antigravity 原生插件 + 可选主 Agent**：
+- **默认轻量原生路径**：通过共享 Runtime (`user_cli.py`) 直接驱动 Codex App Server / CLI，支持 **Git 与非 Git 工作区**、原生 Thread 增量续跑（`--resume`）、运行期 `steer`/`queue`/`interrupt` 实时调控与 0 额外模型调用的离线状态查询。
+- **按需严格契约模式（Strict Workflow）**：面向高保障代码改动、显式审计或有序计划（`PLAN.md`），提供 `allowed_paths` 字节级基线、独立验收测试与信息隔离的只读双轴复审（插件内置 [agy-codex-reviewer.md](agents/agy-codex-reviewer.md)）。
+- **零外部依赖**：全部脚本仅使用 Python 3.10+ 标准库，无需后台常驻守护进程或额外数据库。
 
 ---
 
 ## 核心特性
 
-- **双模型职责分离**：Gemini 负责与你自然沟通和只读复审（Spec + Standards 双维度），Codex CLI 作为唯一写入者（Single-Writer）执行改动，避免多 Agent 并发写同一工作树导致的冲突。
-- **常规决策免打扰闭环**：Worker 遇到常规工程选择（`engineering_choice`）时，由只读 Reviewer 依据项目约定直接拍板并转 `REVISE` 交回原 Codex Session；只有真正的产品取舍（`product_decision`）或真实权限/环境阻塞（`permission` / `environment`）才会升级询问用户。
-- **支持脏工作树（Dirty Worktree）**：任务启动时自动捕获 `allowed_paths` 范围内的文件字节快照（`files-v1`），无需提前 `git commit` 或 `git stash`；复审补丁仅包含任务起点以来的实际增量，且支持 `PASS` 后无缝开启下一项任务。
-- **有限有序计划推进**：支持在同一次 `/run-workflow` 内顺序推进一组已确认的任务（如 `T-01 → T-02 → ...`），基于真实的 Ticket 状态（而非缓存游标）断点续传，遇到阻塞或复审未通过即精确停在当前项。
-- **有界阶段进度与安全进程控制**：默认 `stages` 模式在工作流中仅汇报阶段切换、首次独立验收与最终结果（详细计数每 2 秒静默持久化至本地 `progress.json`），支持按需开启 `detailed` 模式；Windows 下通过 Job Object (`KILL_ON_JOB_CLOSE`) 与启动门控严格管束子进程树，取消时等待清理完成后才释放工作流锁。
+- **意图中介与自主推进**：Gemini 作为唯一用户沟通入口，将模糊需求/体验反馈转化为工程目标，自主消化常规决策与伪阻塞纠偏，避免反复催促“继续”。
+- **认知独立与双向纠偏**：共享事实而非偏见；Codex 独立核验源码与测试并主动纠正不严谨假设；独立只读审查默认隔离 Worker 自述（仅按需读取文件路径），避免锚定效应。
+- **Git 与非 Git 通用运行时**：普通工程目录、中文路径、文档/资料目录均可直接使用；所有运行状态与证据保存在 `~/.gemini/config/agy-codex/workspaces/`（或 Git 仓库 `<git-dir>/superagent/`），绝不污染用户交付目录。
+- **原生 Thread 上下文复用**：连续关联任务通过 `--resume last / RUN_ID / THREAD_ID` 复用同一 Codex Thread，避免重复探索与反复解析原始资料；内置 `models` 目录 TTL 缓存（`--refresh` 强制刷新）。
+- **实时调控与安全进程管束**：运行期支持无锁 Maildir Inbox（`steer` / `queue` / `interrupt`）；Windows 下通过 Job Object (`KILL_ON_JOB_CLOSE`) 与启动门控管束完整子进程树，取消即清理并释放写租约。
+- **可选 Strict 契约模式**：支持脏工作树（`files-v1` 字节基线）、`allowed_paths` 范围控制、独立验收与有限有序计划（`T-01 → T-02 → ...`）断点恢复。
 
 ## 架构概览
 
 ```text
-用户 (自然语言)
+用户 (自然语言 · 目标 · 体验反馈)
   │
   ▼
 AGY 主 Agent (agents/agy-codex.md · Gemini)
-  │  意图收敛 · 范围切分 · 结果解释
-  ▼
-/run-workflow (agy_workflow.py / agy_adapter.py)
-  ├─► plans.py       ── 有限有序计划状态机与断点恢复
-  ├─► progress.py    ── stages/detailed 双模有界进度投递
-  └─► controller.py  ── worktree 串口锁 · 字节级基线 · 独立验收
-        │
-        ├─► Codex CLI (exec / exec resume)  ── 唯一文件写入者
-        └─► AGY 只读 Reviewer (research)    ── Spec & Standards 双轴审查
+  │  意图中介 · 选档路由 · 双向纠偏 · 自主续跑 · 综合交付
+  ├─► 默认轻量路径 (user_cli.py: run / status / inbox / models / doctor)
+  │     └─► 共享 Runtime (runtime.py) ── Git & 非 Git · 写租约互斥 · 原生 Thread 续跑 · 实时 Inbox
+  │           └─► Codex CLI (App Server 优先 / exec 兜底)
+  │
+  └─► 按需严格模式 (/run-workflow: agy_workflow.py / agy_adapter.py)
+        ├─► plans.py / controller.py ── 字节级基线 · 独立测试 · Diff 证据
+        └─► 独立只读 Reviewer (agents/agy-codex-reviewer.md，可配置)
 ```
 
 ---
@@ -139,16 +142,17 @@ python ~/.gemini/config/plugins/agy-codex/skills/agy-codex/scripts/smoke.py veri
 
 ```text
 agy-codex/
-├── plugin.json                        # Antigravity 原生插件清单
+├── plugin.json                        # Antigravity 原生插件清单 (v0.3.0)
 ├── install.py                         # 跨平台安装 / 备份 / 卸载器
 ├── LICENSE                            # MIT License
 ├── agents/
-│   └── agy-codex.md                   # 可选主 Agent 系统提示与协作规则
+│   ├── agy-codex.md                   # 可选主 Agent 系统提示与协作规则
+│   └── agy-codex-reviewer.md          # 插件内置最小只读 Reviewer 子代理
 ├── skills/
 │   └── agy-codex/
-│       ├── SKILL.md                   # 执行手册与 /agy-codex 入口
+│       ├── SKILL.md                   # v0.3 执行手册与 /agy-codex 入口
 │       ├── references/                # 规划、执行、复审、恢复与宿主调用契约
-│       └── scripts/                   # 控制器、计划引擎、进度投递与冒烟工具
+│       └── scripts/                   # 共享 Runtime、轻量 CLI、Strict 控制器与后端适配
 └── tests/                             # 离线集成测试与协议回归套件
 ```
 

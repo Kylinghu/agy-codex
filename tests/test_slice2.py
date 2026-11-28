@@ -170,6 +170,31 @@ class Slice2SlimmingTests(unittest.TestCase):
         self.assertEqual(len(hist), 1)
         self.assertEqual(hist[0]["text"], "Add tag")
 
+    def test_review_input_isolates_done_worker_report_to_file_path(self):
+        import product
+        self.f.create()
+        state = self.f.controller.run(self.f.ticket_id)
+        self.assertEqual(state["status"], "REVIEW")
+        packet = self.f.controller.packet(self.f.ticket_id)
+        self.assertEqual(packet["worker_report"]["outcome"], "done")
+
+        fresh_data = product.review_input(self.f.controller, state, packet, fresh=True)
+        self.assertNotIn("worker_report", fresh_data)
+        self.assertTrue(Path(fresh_data["worker_report_path"]).is_file())
+        self.assertIn("last_message_path", fresh_data)
+
+        followup_data = product.review_input(self.f.controller, state, packet, fresh=False)
+        self.assertNotIn("worker_report", followup_data)
+        self.assertTrue(Path(followup_data["worker_report_path"]).is_file())
+
+        # Non-done outcomes remain inline so reviewers can act on blockers/decisions immediately.
+        blocked_packet = dict(packet, worker_report={
+            "outcome": "blocked", "summary": "Blocked", "changes": [], "checks": [],
+            "issue": {"kind": "permission", "detail": "d", "evidence": "e", "question": "", "recommendation": "r"},
+        })
+        blocked_data = product.review_input(self.f.controller, state, blocked_packet, fresh=True)
+        self.assertEqual(blocked_data["worker_report"]["outcome"], "blocked")
+
 
 class Slice2ModelCatalogCacheTests(unittest.TestCase):
     def setUp(self):
