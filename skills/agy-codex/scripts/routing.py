@@ -3,7 +3,7 @@ from config import load
 
 
 def policy(root):
-    from controller import WorkflowError, codex_settings
+    from runtime import WorkflowError, codex_settings
     value = load(root)["routing"]
     if set(value) - {"strategy", "tiers", "default_tier", "allow_upgrade", "allowed_providers"}:
         raise WorkflowError("Unknown routing configuration field.")
@@ -34,7 +34,7 @@ def policy(root):
 
 
 def select(root, tier=None):
-    from controller import WorkflowError
+    from runtime import WorkflowError
     p = policy(root)
     if tier is None:
         if p["strategy"] == "manual" or p["default_tier"] is None:
@@ -46,14 +46,14 @@ def select(root, tier=None):
 
 
 def verify_provider(root, provider):
-    from controller import WorkflowError
+    from runtime import WorkflowError
     allowed = policy(root)["allowed_providers"]
     if allowed and provider not in allowed:
         raise WorkflowError("Codex provider is outside the configured allowlist.")
 
 
 def validate_catalog(requested, models):
-    from controller import WorkflowError
+    from runtime import WorkflowError
     model = requested.get("model")
     if not model:
         return
@@ -67,10 +67,10 @@ def validate_catalog(requested, models):
         raise WorkflowError(f"Requested effort {effort} is not in the model catalog.")
 
 
-def discover(rpc, provider=None, *, include_rates=True):
-    from controller import WorkflowError
+def discover(rpc, state_dir, cwd, provider=None, *, include_rates=True):
+    from runtime import WorkflowError
     from backends.codex_app_server import RpcError
-    config = rpc.call("config/read", {"cwd": str(rpc.c.repo), "includeLayers": False}, timeout=20).get("config", {})
+    config = rpc.call("config/read", {"cwd": str(cwd), "includeLayers": False}, timeout=20).get("config", {})
     provider_response = rpc.call("modelProvider/list", {}, timeout=20)
     provider = provider or config.get("model_provider") or provider_response.get("defaultProviderId")
     providers = provider_response.get("data", [])
@@ -90,11 +90,11 @@ def discover(rpc, provider=None, *, include_rates=True):
         seen.add(cursor)
     rates = None
     if include_rates:
-        from controller import Interrupted
+        from runtime import Interrupted
         try:
             rates = rpc.call("account/rateLimits/read", {}, timeout=10)
         except (RpcError, Interrupted):
-            if rpc.c.cancel.is_set():
+            if rpc.cancel.is_set():
                 raise
     # Only expose noncredential fields, never native config layers or provider URLs.
     return {"default_model": config.get("model"), "default_provider": provider,
@@ -107,14 +107,76 @@ def discover(rpc, provider=None, *, include_rates=True):
                 "ordinaryUsageAllowed": rates.get("ordinaryUsageAllowed"),
                 "rateLimits": {k: (rates.get("rateLimits") or {}).get(k)
                                for k in ("primary", "secondary", "planType")}},
-            "catalog_is_not_entitlement": True, "routing": policy(rpc.c.root)}
+            "catalog_is_not_entitlement": True, "routing": policy(state_dir)}
 
 
-def probe(c):
+CATALOG_TTL_SECONDS = 600
+RATES_TTL_SECONDS = 120
+
+
+def _cache_key(state_dir, requested, include_rates, launcher):
+    import hashlib
+    from pathlib import Path
+    from runtime import current_codex_home, encode
+    codex_home = current_codex_home()
+    cfg_toml = Path(codex_home) / "config.toml"
+    cfg_stat = None
+    try:
+        st = cfg_toml.stat()
+        cfg_stat = [st.st_mtime_ns, st.st_size]
+    except OSError:
+        cfg_stat = None
+    raw = encode({
+        "codex_home": codex_home,
+        "codex_config_stat": cfg_stat,
+        "launcher": list(launcher),
+        "requested": requested,
+        "routing": policy(state_dir),
+        "include_rates": bool(include_rates),
+    })
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def probe(target, *, codex_cmd=None, refresh=False, include_rates=True):
+    """Discover models and rate limits for either a Workspace or a Strict Controller.
+
+    Uses a lightweight TTL cache (invalidated on config/provider/CODEX_HOME change
+    or explicit refresh=True). Cache is never treated as entitlement proof.
+    """
     import tempfile
-    from controller import resolve_codex
+    import time
+    from pathlib import Path
+    from runtime import Workspace, atomic_json, read_json, resolve_codex
     from backends.codex_app_server import Client
+
+    if isinstance(target, Workspace):
+        cwd, state_dir, launcher = target.root_path, target.state_dir, codex_cmd or resolve_codex()
+    else:
+        cwd, state_dir, launcher = target.repo, target.root, codex_cmd or target.codex_cmd or resolve_codex()
+
+    requested = load(state_dir)["codex"]
+    cache_path = Path(state_dir) / "model-catalog-cache.json"
+    key = _cache_key(state_dir, requested, include_rates, launcher)
+    ttl = RATES_TTL_SECONDS if include_rates else CATALOG_TTL_SECONDS
+    if not refresh and cache_path.is_file():
+        try:
+            cached = read_json(cache_path)
+            if (cached.get("key") == key
+                    and isinstance(cached.get("cached_at"), (int, float))
+                    and (time.time() - cached["cached_at"]) < ttl
+                    and isinstance(cached.get("data"), dict)):
+                out = dict(cached["data"])
+                out["from_cache"] = True
+                return out
+        except (OSError, ValueError):
+            pass
+
     with tempfile.TemporaryDirectory(prefix="agy-model-catalog-") as directory:
-        requested = load(c.root)["codex"]
-        with Client(c, c.codex_cmd or resolve_codex(), directory, requested=requested, timeout=60) as rpc:
-            return discover(rpc, requested.get("model_provider"))
+        with Client(cwd, launcher, directory, requested=requested, timeout=60) as rpc:
+            data = discover(rpc, state_dir, cwd, requested.get("model_provider"), include_rates=include_rates)
+    try:
+        atomic_json(cache_path, {"key": key, "cached_at": time.time(), "data": data})
+    except OSError:
+        pass
+    data["from_cache"] = False
+    return data

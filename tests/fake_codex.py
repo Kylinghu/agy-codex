@@ -5,6 +5,7 @@ Runs in a disposable Git repository. Its control file and invocation ledger live
 under .git, so they cannot accidentally appear as implementation changes.
 """
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -18,9 +19,10 @@ def emit(event):
 
 def main():
     argv = sys.argv[1:]
-    if argv[:5] != ["-a", "never", "-s", "workspace-write", "exec"]:
+    if len(argv) < 5 or argv[:3] != ["-a", "never", "-s"] or argv[3] not in ("workspace-write", "read-only", "danger-full-access") or argv[4] != "exec":
         print("Unexpected CLI contract: " + repr(argv), file=sys.stderr)
         return 64
+    sandbox = argv[3]
     rest = argv[5:]
     resumed = bool(rest and rest[0] == "resume")
     if resumed:
@@ -31,21 +33,35 @@ def main():
         if rest[0] == "-c" and not rest[1].startswith(("model_reasoning_effort=", "model_provider=")):
             return 64
         rest = rest[2:]
-    if len(rest) != (7 if resumed else 6) or rest[:2] != ["--json", "-o"] or rest[3] != "--output-schema" or rest[-1] != "-":
+    if rest and rest[0] == "--skip-git-repo-check":
+        rest = rest[1:]
+    if len(rest) < 4 or rest[:2] != ["--json", "-o"] or rest[-1] != "-":
         print("Unexpected exec arguments: " + repr(rest), file=sys.stderr)
         return 64
     output = Path(rest[2])
-    schema = json.loads(Path(rest[4]).read_text())
-    if schema["properties"]["outcome"]["enum"] != ["done", "decision_required", "blocked"]:
+    tail = rest[3:-1]
+    has_schema = False
+    if tail and tail[0] == "--output-schema":
+        if len(tail) < 2:
+            return 64
+        schema = json.loads(Path(tail[1]).read_text())
+        if schema["properties"]["outcome"]["enum"] != ["done", "decision_required", "blocked"]:
+            return 64
+        has_schema = True
+        tail = tail[2:]
+    if len(tail) != (1 if resumed else 0):
+        print("Unexpected exec tail: " + repr(tail), file=sys.stderr)
         return 64
-    requested_session = rest[5] if resumed else None
+    requested_session = tail[0] if resumed else None
     prompt = sys.stdin.buffer.read().decode("utf-8")
     if not prompt.strip():
         print("A prompt on stdin is required", file=sys.stderr)
         return 64
 
     repo = Path.cwd()
-    gitdir = repo / ".git"
+    ctrl_env = os.environ.get("AGY_FAKE_CONTROL_DIR")
+    gitdir = Path(ctrl_env) if ctrl_env else (repo / ".git")
+    gitdir.mkdir(parents=True, exist_ok=True)
     control_path = gitdir / "fake-codex-control.json"
     control = json.loads(control_path.read_text()) if control_path.exists() else {}
     mode = control.get("mode", "success")

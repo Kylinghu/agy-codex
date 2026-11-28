@@ -2,8 +2,8 @@
   "$schema": "https://antigravity.google/schemas/v1/plugin.json",
   "name": "agy-codex",
   "displayName": "AGY Codex",
-  "version": "0.2.0",
-  "description": "Run Codex CLI tasks and agreed plans from Antigravity, with Gemini handling communication, routine engineering decisions, and read-only review.",
+  "version": "0.3.0",
+  "description": "Unified Gemini + Codex CLI dual-model agent for Antigravity: lightweight native Thread execution (Git & non-Git), autonomous progression, cognitive independence, live inbox control, and optional Strict Workflow.",
   "author": {
     "name": "Kylinghu",
     "url": "https://github.com/Kylinghu"
@@ -19,8 +19,8 @@
     "code-review"
   ],
   "suggestedPrompts": [
-    "/agy-codex 按 PLAN.md 中已确认的任务顺序执行，逐项复审，通过后继续下一项。",
-    "/agy-codex 修复这个问题，常规工程选择按现有项目约定推进。",
-    "/agy-codex 查看当前任务进度和需要我决定的具体问题。"
+    "/agy-codex 修复这个问题并补充必要验证，常规工程选择直接推进。",
+    "/agy-codex 延续上次会话继续完成剩余改动，不要重复扫描无关文件。",
+    "/agy-codex 按 PLAN.md 中已确认的任务顺序执行，逐项复审，通过后继续下一项。"
   ]
 }

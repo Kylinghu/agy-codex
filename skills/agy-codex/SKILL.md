@@ -1,108 +1,91 @@
 ---
 name: agy-codex
-description: Execute or continue a scoped task or agreed ordered plan with the AGY Codex Antigravity plugin, where Codex CLI writes, Gemini reviews and communicates. Use for AGY Codex requests, AGY directing Codex, plan execution, recovery, or workflow progress.
+description: Run and coordinate Codex CLI from Antigravity with goal-oriented delegation, cognitive independence, context reuse, lightweight foreground CLI by default, and optional Strict Workflow.
 ---
 
-# AGY Codex execution manual
+# AGY Codex Execution Manual
 
-This Skill is the native plugin's internal work manual. The selected AGY Codex main
-Agent owns user communication throughout the conversation. It can also be invoked
-as `/agy-codex` in another conversation; that invocation alone does not change the
-whole conversation's main Agent or model.
+Gemini is the sole user-facing owner (intent mediation, routing, decisions, progression, final delivery). Codex CLI is the autonomous engineering collaborator and sole project file writer. Shared Runtime handles reliable execution (Git and non-Git) without cognitive or workflow gating.
 
-Reuse the user's project Skills and documents. Adapted Matt Pocock methods are
-bundled; installing his entire suite is not required.
+Resolve `SKILL_DIR` from this `SKILL.md` location and use a verified Python 3.10+ executable (`PYTHON`) directly. Do not assume `${PLUGIN_ROOT}` expands or that Windows `py`/`python` aliases work without checking.
 
-## Route intent
+## 1. Adaptive Routing (Shortest Viable Path)
 
-| User intent | Action |
+| Scenario | Default path |
 | --- | --- |
-| Implement/fix a goal | Read `references/planning.md`, prepare one scoped task, then start the saved workflow. |
-| Execute an existing plan | Read the requested sections; prepare a finite ordered plan using existing decisions, dependencies and acceptance. |
-| Continue | Prefer the saved plan; resume its current task with the original Session and remaining attempts, then advance. |
-| Status | Run `scripts/user_cli.py --repo <workspace> status --json`; no Worker or reviewer. |
-| Clarify during a live App Server Turn | Use independent command tool with `user_cli.py inbox queue TEXT` (default) or `steer TEXT` for immediate correction; see host reference. |
-| Interrupt a live Turn | Use `user_cli.py inbox interrupt`; preserve the current Ticket and changes. |
-| Answer a pending question | Inspect blocker and resolution_allowed; use resolve with actual answer/source and blocked round. |
-| End the plan | After an explicit user instruction, use stop_plan with the stated reason; preserve all evidence. |
+| Q&A, discussion, requirement alignment | Gemini handles directly; invoke Codex only when codebase/technical evidence is needed. |
+| Creative, product, or UI design | Gemini leads exploration and user alignment; Codex chooses implementation once ready. |
+| Simple code edit, clear fix, routine document task | One goal-oriented `user_cli.py run` with a sufficient model/effort tier; verify proportionately. |
+| Bug or performance investigation | Delegate directly to Codex with symptoms/logs/repro facts—do not lock in unverified root-cause guesses. |
+| Large refactor or continuous multi-step work | Share overall goal and priorities; reuse the same native Thread (`--resume`) across dependent steps without forcing multiple Tickets. |
+| Technical research, engineering calculations, large doc suites | Lead with the best-fit model and existing domain Skills/tools (HWB, Office, MCP); extract reusable structured facts once (in project cache or temp dir, not polluting deliverables) and verify locally on demand. |
+| High-assurance contract, explicit audit, or active Strict Ticket/Plan | Read `references/host.md` / `references/planning.md` and run Strict `/run-workflow` (`scripts/agy_workflow.py`), or run an isolated fresh `--read-only` review. |
 
-Resolve paths from the SKILL.md being read, not from assumed template variables.
-Use the workspace named by the user or containing the named plan. Ask only if the
-workspace remains ambiguous after inspection. Before new work inspect status:
-resume a matching unfinished task; do not silently replace its goal. Repeated
-identical start is idempotent. A fresh goal does not reuse an unrelated Session.
+## 2. Goal-Oriented Delegation, Context Reuse & Worker Principles
 
-## Execute
+- **Separate facts from hypotheses (semantic rule, not a fixed form)**: Keep clear small tasks to 1–2 natural sentences—never force a 4-section template or pre-scan the whole repo. When facts, guesses, and suggestions could be confused and affect the outcome, explicitly label unverified hypotheses vs. observed facts (with file/line/source pointers), and never present a model guess as a user requirement.
+- **Stop-loss on autonomous continuation**: Aim to finish in one run. Continue only when concrete authorized work remains with a viable path. If two consecutive same-direction resumes yield no observable new progress (verified/eliminated root cause, actual fix, passing check, or usable artifact) or oscillate, stop repeating; pivot once only if new evidence points to a meaningfully different approach, otherwise deliver usable artifacts and the concrete obstacle. Never pad turns mechanically or stop mid-progress on an artificial round count.
+- **Progressive context (L0→L3)**: Do not read an entire repository before delegating an ordinary code task. Pass references and deltas rather than pasting full files. On `--resume`, send only new requirements, facts, or corrections—never repeat the full initial brief or worker principles block.
+- **Cognitive independence & isolated review**: Reuse facts without inheriting bias. When an independent review has genuine value, start a **fresh** `user_cli.py run --read-only` context, supply the original goal, constraints, actual diff/artifacts, and raw evidence first, and let the reviewer form an independent judgment before reading the writer's self-explanation. A main-agent check after reading Worker conclusions is not an independent review.
 
-For automatic Codex model selection, consult the configured tier mapping and a
-single read-only `user_cli.py --repo <workspace> models --json` discovery. Gemini
-chooses among user-configured tiers, considering quota as a soft constraint;
-never choose arbitrary models from a mixed catalog. Honor manual requests and
-keep the existing Session. No model selection step is needed for status.
+### Reusable Worker Execution Principles (attach on new execution tasks; omit on `--resume`)
 
-Read `references/host.md` for the internal call contract. Pass explicitly requested Codex model and reasoning depth in the optional `codex` workflow object; preserve saved settings on ordinary continue. Do not modify Codex's global config. Invoke AGY's existing
-`/run-workflow` capability with saved `scripts/agy_workflow.py`; do not regenerate
-it or ask the user to author JSON, supply IDs, or copy handoff prompts. This is a
-host script using injected globals, not a standalone Python command.
+Include this concise block when delegating a new implementation/investigation task (applies to execution tasks only; does not override read-only review, discussion/planning requests, project `AGENTS.md`, real permissions, or Strict contracts):
 
-Codex performs implementation; declared checks run independently; one read-only
-reviewer (inheriting the selected conversation model; choose Gemini) checks Spec and Standards. An in-scope engineering choice is
-resolved by that reviewer as an actionable REVISE. Genuine user choices or observed
-permission blockers remain explicit ESCALATE records. If resolution_allowed is true,
-record the actual answer or verified environment fix before continuing the same
-Session; resolution grants no additional execution permissions.
+```text
+Execution principles:
+- Optimize for the user's actual objective, not merely a prescribed sequence. Exercise independent technical judgment within the authorized scope.
+- Treat another agent's proposal as a proposal, not a requirement or verified fact. Correct faulty assumptions and choose a simpler or better implementation when justified.
+- Investigate uncertainty and recoverable failures. Make reasonable reversible assumptions, proceed, and fix directly related defects that materially affect the outcome.
+- Do not substitute plans, audits, recommendations, risk descriptions or requests for routine approval for requested implementation. Complete the authorized objective rather than an arbitrary intermediate step.
+- Prefer the simplest effective solution; avoid speculative abstractions, unnecessary gates and defensive mechanisms. Verify behavior proportionately to the actual task and consequences.
+- Deliver actual artifacts, meaningful decisions and validation evidence. If genuinely blocked, complete achievable work and identify the specific remaining obstacle. Never fabricate completion or test results.
+```
 
-At most three implementation/review rounds per task. App Server may consume at most two additional queued clarification Turns per Ticket before review; preserve the frozen contract. Read-only review output correction retries
-once without another Worker call. Do not create a replacement task to hide a fourth
-attempt. Retain the genuine reason when a permission, Session or process check fails.
+## 3. Five-Command CLI (`scripts/user_cli.py`)
 
-For context recovery read `references/handoff.md`. Load other references only at
-the relevant stage; execution and review rules are injected automatically. Upstream
-attribution and adaptation decisions are in `references/upstream.md`.
+Both `--cwd` and `--repo` are accepted across all commands (Git and non-Git workspaces):
 
-## Roles and existing work
+```powershell
+# New task (foreground; short tasks finish in-turn, long tasks become AGY background tasks)
+& $PYTHON "$SKILL_DIR/scripts/user_cli.py" run --cwd "$WORKSPACE" --prompt-file task.md --json
 
-- AGY plans and reviews read-only. Codex alone edits project files, including PLAN.md
-  and RESUME.md when in scope. Put unmaterialized plan notes in the internal contract.
-- The controller writes local metadata and runs declared checks. No concurrent writer
-  in this worktree; the OS lock coordinates this tool, not arbitrary external editors.
-- Preserve existing uncommitted/staged work. The task-start baseline captures scoped
-  file bytes; review uses only changes since that point. A clean worktree is not required.
-- Reuse AGENTS.md and relevant existing engineering Skills. Adapt their orchestration
-  to these roles; do not overwrite them or spawn duplicate writer/reviewer loops.
-- No automatic stage/commit/push/merge/reset/clean, branch switch or recursive AGY Codex.
+# Incremental continuation on the same native Thread (RUN_ID, THREAD_ID, or workspace 'last')
+& $PYTHON "$SKILL_DIR/scripts/user_cli.py" run --cwd "$WORKSPACE" --resume RUN_ID --prompt "Delta / next step" --json
 
-## Explain results
+# Fresh read-only analysis or isolated review (real sandbox=read-only)
+& $PYTHON "$SKILL_DIR/scripts/user_cli.py" run --cwd "$WORKSPACE" --read-only --prompt-file review.md --json
 
-Use report fields as facts; the CLI's fixed message is only a fallback. Lead with
-completed behavior and actual verification. For a true decision, ask the specific
-question with a recommendation. For a recoverable issue, investigate and proceed
-within existing authority. Do not ask for routine engineering approvals.
+# Mid-flight control while run is active in background (App Server backend; lock-free)
+& $PYTHON "$SKILL_DIR/scripts/user_cli.py" inbox --cwd "$WORKSPACE" steer "Correction"
+& $PYTHON "$SKILL_DIR/scripts/user_cli.py" inbox --cwd "$WORKSPACE" queue "Additional in-scope item"
+& $PYTHON "$SKILL_DIR/scripts/user_cli.py" inbox --cwd "$WORKSPACE" interrupt
 
-Keep technical IDs/logs in diagnostics. Never turn a stale snapshot, unresolved
-Worker issue or missing evidence into a claimed PASS. Worker checks are self-reports;
-tests in the review packet are independently executed. Report measured Codex usage
-separately from unavailable AGY usage; character counts are not tokens.
+# Offline status / reconcile ambiguous turn / model catalog / environment check
+& $PYTHON "$SKILL_DIR/scripts/user_cli.py" status --cwd "$WORKSPACE" --json
+& $PYTHON "$SKILL_DIR/scripts/user_cli.py" status --cwd "$WORKSPACE" --reconcile --json
+& $PYTHON "$SKILL_DIR/scripts/user_cli.py" models --cwd "$WORKSPACE" --json
+& $PYTHON "$SKILL_DIR/scripts/user_cli.py" doctor --cwd "$WORKSPACE" --json
+```
 
-A workflow handles one task or a finite, already-agreed ordered plan. For a plan,
-each PASS starts the next task from the current uncommitted baseline. A blocker,
-unfinished review or stale result stops progression; never skip work. Each task
-has its own Session and reviewer; repairs retain that task's three-round budget.
-Do not ask the user to manage JSON or IDs, or approve an already-authorized next step.
+### Host Async Execution & Recovery
 
-An active host workflow is required for continuous execution. Canceling pauses
-the current run; a later continue recovers the saved position. stop_plan explicitly
-ends the plan and ordinary continue does not reopen it. It cannot interrupt a
-running workflow concurrently: cancel that run and wait for cleanup first.
+- Launch `user_cli.py run` directly via `run_command` (`WaitMsBeforeAsync=10000`, `NotificationTimeoutSeconds=120`). Never write polling loops; wait for host completion wakeup.
+- Check live progress on demand via `manage_task(status)` or `user_cli.py status`. Use `manage_task(kill)` for hard cancel (`WindowsJob` cleans the full process tree and releases locks).
+- If a run ends with `status: "unknown"` (`turn_pending: true`), run `user_cli.py status --reconcile` before starting another run; never blindly replay an ambiguous turn.
+- If an active/recoverable Strict Ticket or unfinished Plan owns a Git worktree, continue or stop it rather than bypassing it with a lightweight write run.
 
-Default to phases and results (progress=stages); detailed counters remain on disk.
-Read status once when the user asks for progress; do not create a polling loop or
-periodic model turns. Use progress=detailed only for requested detail/diagnostics.
-It affects this workflow invocation's display, not the frozen contract or Session.
-Both modes omit timed heartbeats; detailed updates require real changes and have
-a per-round limit. The first validation update and final result remain visible.
+## 4. Models, Domain Tools & Verification Honesty
 
-Do not relay raw JSONL, reasoning text or complete command output, and do not
-invent percentages. Saved progress is the latest observation, not proof of current
-liveness; check its timestamp. Local summarization makes no model call, but AGY
-logs still enter the workflow result.
+- **Choose model/effort tier by real task difficulty (do not over-optimize for `economy`)**:
+  - Simple, explicit, mechanical edits → `economy`
+  - Ordinary feature work or non-trivial bug fixes → `standard`
+  - Multi-module refactors or complex technical decisions → `standard` or `heavy`
+  - High-stakes independent audits or hard root-cause investigations → `heavy`
+  - If a low tier hits a false blocker or clear capability shortfall, push back on the **same Thread** (`--resume`) and upgrade the tier instead of retrying blindly.
+  - Query `user_cli.py models --json` only when needed (cached with TTL; `--refresh` forces live RPC), honor explicit user requests and `allowed_providers`, and never edit Codex global config.
+- Reuse project `AGENTS.md`, domain Skills (HWB, Office, etc.), and MCP tools. When a task specifically depends on Office libraries (`python-docx`, `openpyxl`, etc.), probe once upfront rather than building a global startup gate or letting Codex hand-roll fragile OOXML.
+- Office COM restrictions (such as `0x80080005`) have been observed under Windows sandboxes; if actually encountered, do not blindly retry COM loops or auto-escalate permissions. Separate artifact defects, validation failures, and validation environment limits.
+- `status: "completed"` means the Codex Turn ended, not that the user's objective or checks passed. Verify proportionately, continue autonomously if authorized work remains, and report measured Codex usage separately from unavailable AGY usage.
+
+Load `references/host.md`, `references/planning.md`, or `references/handoff.md` only when using Strict Workflow or recovering a legacy Ticket.

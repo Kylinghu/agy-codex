@@ -22,15 +22,18 @@ class AdapterTests(unittest.TestCase):
         self.prompts = []
         self.logs = []
 
-    def run_adapter(self, reviewer):
+    def run_adapter(self, reviewer, **extra):
         def factory(**options):
             self.factory_options.append(options)
             return reviewer
+        args = {"ticket": self.f.ticket_id}
+        args.update(extra.pop("workflow_args", {}))
         return asyncio.run(agy_adapter.run_workflow(
             agent_fn=factory, phase_fn=lambda value: None, log_fn=self.logs.append,
-            workflow_args={"ticket": self.f.ticket_id}, controller=self.f.controller, preflight=False))
+            workflow_args=args, controller=self.f.controller,
+            preflight=extra.pop("preflight", False)))
 
-    def test_adapter_revise_resume_pass_uses_one_research_reviewer(self):
+    def test_adapter_revise_resume_pass_uses_one_read_only_reviewer(self):
         async def reviewer(prompt, schema):
             self.prompts.append(prompt)
             packet = json.loads(prompt.split("\n\nREVIEW_PACKET\n", 1)[1])
@@ -41,10 +44,49 @@ class AdapterTests(unittest.TestCase):
         result = self.run_adapter(reviewer)
         self.assertEqual(result["status"], "PASS", result)
         self.assertEqual(result["round"], 2)
-        self.assertEqual(self.factory_options, [{"role": "AGY read-only reviewer", "type_name": "research", "workspace": "inherit"}])
+        self.assertEqual(
+            self.factory_options,
+            [{"role": "AGY read-only reviewer", "type_name": "agy-codex-reviewer", "workspace": "inherit"}],
+        )
         self.assertEqual(len(self.f.calls()), 2)
         self.assertTrue(self.f.calls()[1]["resume"])
         self.assertIn("F-001", self.prompts[1])
+
+    def test_reviewer_type_configurable_and_self_blocked_by_default(self):
+        async def reviewer(prompt, schema):
+            return self.f.review()
+
+        blocked = self.run_adapter(reviewer, workflow_args={"reviewer_type": "self"})
+        self.assertEqual(blocked["status"], "REVIEW")
+        self.assertIn("self", blocked["review_error"])
+        self.assertEqual(len(self.f.calls()), 1)
+
+        custom = self.run_adapter(reviewer, workflow_args={"reviewer_type": "custom-ro-reviewer"})
+        self.assertEqual(custom["status"], "PASS", custom)
+        self.assertEqual(self.factory_options[-1]["type_name"], "custom-ro-reviewer")
+        self.assertEqual(len(self.f.calls()), 1)
+
+    def test_self_reviewer_explicit_opt_in_marks_non_independent_source(self):
+        async def reviewer(prompt, schema):
+            return self.f.review()
+
+        result = self.run_adapter(
+            reviewer,
+            workflow_args={"reviewer_type": "self", "allow_non_independent_self_review": True},
+        )
+        self.assertEqual(result["status"], "PASS", result)
+        state = self.f.controller.load(self.f.ticket_id)
+        self.assertEqual(state["last_review"]["reviewer_source"], "agy-self-non-independent")
+
+    def test_missing_reviewer_factory_error_preserves_review_without_rerunning_worker(self):
+        def missing_factory(**options):
+            raise RuntimeError("Subagent type not registered: agy-codex-reviewer")
+        result = asyncio.run(agy_adapter.run_workflow(
+            agent_fn=missing_factory, phase_fn=lambda value: None, log_fn=self.logs.append,
+            workflow_args={"ticket": self.f.ticket_id}, controller=self.f.controller, preflight=False))
+        self.assertEqual(result["status"], "REVIEW")
+        self.assertIn("not registered", result["review_error"])
+        self.assertEqual(len(self.f.calls()), 1)
 
     def test_reviewer_error_preserves_pending_review_without_rerunning_worker(self):
         async def unavailable(prompt, schema):

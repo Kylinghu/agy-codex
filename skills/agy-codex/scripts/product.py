@@ -169,14 +169,27 @@ def report(controller, state=None):
 
 
 def review_input(controller, state, packet, fresh):
-    """Keep the complete packet on disk; a live reviewer gets only new input."""
+    """Keep the complete packet on disk; isolate Worker self-report on normal done reviews."""
+    round_dir = controller._round_dir(state)
+    worker_report_file = round_dir / "worker-report.json"
+    worker_report = packet.get("worker_report")
+    # Information isolation: when Worker claims done, omit inline worker_report so the
+    # read-only Reviewer evaluates goal, diff, and independent tests first and reads
+    # worker_report_path / last_message_path via read_file only after forming its own judgment.
+    # Retain inline worker_report for explicit non-done outcomes (blocked/decision/invalid).
+    inline_worker_report = isinstance(worker_report, dict) and worker_report.get("outcome") != "done"
+
     if fresh:
         data = dict(packet, review_mode="full")
+        if not inline_worker_report:
+            data.pop("worker_report", None)
     else:
         keys = ("ticket_id", "round", "snapshot_sha256", "worktree", "changed_files",
                 "tests", "all_tests_passed", "diff_path", "summary_path", "last_message_path",
-                "diff_basis", "diff_metadata_path", "worker_report")
+                "diff_basis", "diff_metadata_path")
         data = {key: packet.get(key) for key in keys}
+        if inline_worker_report:
+            data["worker_report"] = worker_report
         data.update(review_mode="followup", contract_path=str(controller._contract_path(state)),
                     unresolved_findings=(state.get("last_review") or {}).get("findings", []))
         previous_path = controller.ticket_dir(state["id"])/"rounds"/f"{state['round']-1:02d}"/"snapshot.json"
@@ -184,6 +197,8 @@ def review_input(controller, state, packet, fresh):
             previous = read_json(previous_path)
             current = read_json(controller._round_dir(state)/"snapshot.json")
             data["files_changed_since_review"] = controller._changed(current, previous)
+    if worker_report_file.is_file():
+        data["worker_report_path"] = str(worker_report_file)
     # Decisions outlive last_review, which later REVISE verdicts replace. Rebuild
     # from the Ticket for both modes, including packets saved before this field.
     data["resolutions"] = state.get("resolutions", [])

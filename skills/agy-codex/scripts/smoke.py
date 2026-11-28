@@ -140,10 +140,15 @@ def probe(repo):
     return result
 
 
+def _is_independent_agy_review(review):
+    src = str((review or {}).get("reviewer_source") or "")
+    return src.startswith("agy-") and src != "agy-self-non-independent"
+
+
 def verify(repo, ticket="SMOKE-001"):
     c = Controller(repo); state = c.load(ticket)
     review = state.get("last_review") or {}
-    result = {"ticket": brief(state), "agy_review": review.get("reviewer_source") == "agy-research",
+    result = {"ticket": brief(state), "agy_review": _is_independent_agy_review(review),
               "snapshot_unchanged": c.snapshot_for(state)["sha256"] == state["expected_sha256"]}
     result["passed"] = state["status"] == "PASS" and result["agy_review"] and result["snapshot_unchanged"]
     # A recorded reviewer source is workflow provenance, not cryptographic host attestation.
@@ -157,7 +162,7 @@ def verify_plan(repo):
     if not plan:
         raise WorkflowError("No saved smoke plan was found.")
     summary = plan_report(c, plan)
-    reviews = [bool((c.load(row["ticket_id"]).get("last_review") or {}).get("reviewer_source") == "agy-research")
+    reviews = [bool(_is_independent_agy_review(c.load(row["ticket_id"]).get("last_review")))
                if row["status"] != "PENDING" else False for row in summary["tasks"]]
     result = {"plan": summary, "agy_review_recorded_per_task": reviews,
               "passed": summary["verified"] and all(reviews),

@@ -1,23 +1,119 @@
-"""Stages and results by default; optional bounded details, no timed log heartbeats."""
+"""Live progress projection for both foreground CLI runs and Strict workflows."""
 from __future__ import annotations
 
 import asyncio
 import contextlib
+from pathlib import Path
 import queue
+import sys
 import time
 
-from controller import WorkflowError, atomic_json, now
+from runtime import WorkflowError, atomic_json, now
 
 POLL_SECONDS = 0.2
 DETAIL_SECONDS = 5.0
 DETAIL_LIMIT = 12
 PERSIST_SECONDS = 2.0
+CLI_THROTTLE_SECONDS = 3.0
+_DEFAULT_STREAM = object()
 
 
 def validate_mode(mode):
     if mode not in ("stages", "detailed"):
         raise WorkflowError("progress must be stages (default) or detailed.")
     return mode
+
+
+def _sanitize_name(name):
+    return "".join(c if c.isprintable() else " " for c in name)[:80]
+
+
+class CliProgress:
+    """Throttled, deduplicated progress reporter for foreground `user_cli.py run`.
+
+    Writes `progress.json` for offline status queries and emits concise single-line
+    updates to stderr (visible via AGY `manage_task(status)`) with no hard 12-line cap.
+    """
+    def __init__(self, progress_path, run_id, *, stream=_DEFAULT_STREAM, throttle_seconds=CLI_THROTTLE_SECONDS):
+        self.path = Path(progress_path)
+        self.run_id = run_id
+        self.stream = sys.stderr if stream is _DEFAULT_STREAM else stream
+        self.throttle_seconds = throttle_seconds
+        self.started = time.monotonic()
+        self.last_emit = 0.0
+        self.last_persist = 0.0
+        self.last_signature = None
+        self.files = set()
+        self.state = {
+            "schema_version": 1, "run_id": run_id, "stage": "worker",
+            "commands_completed": 0, "commands_running": 0,
+            "changed_file_count": 0, "recent_files": [],
+            "running": True, "elapsed_seconds": 0,
+            "updated_at": now(), "last_event_at": None,
+        }
+
+    def emit(self, event):
+        kind = event.get("kind")
+        if kind == "stage" and "stage" in event:
+            self.state["stage"] = event["stage"]
+        elif kind == "command":
+            if event.get("completed"):
+                self.state["commands_completed"] += 1
+                self.state["commands_running"] = max(0, self.state["commands_running"] - 1)
+            else:
+                self.state["commands_running"] += 1
+        elif kind == "files":
+            for path in event.get("paths", []):
+                if isinstance(path, str) and path:
+                    self.files.add(path)
+            self.state["changed_file_count"] = len(self.files)
+            self.state["recent_files"] = [_sanitize_name(n) for n in sorted(self.files)[-3:]]
+        else:
+            return
+        self.state["last_event_at"] = now()
+        self._flush(force=False)
+
+    def _line(self, final_status=None):
+        elapsed = self.state["elapsed_seconds"]
+        files = f", files={self.state['changed_file_count']}" if self.state["changed_file_count"] else ""
+        recent = f" ({', '.join(self.state['recent_files'])})" if self.state["recent_files"] else ""
+        if final_status is not None:
+            return (f"[agy-codex {self.run_id}] {final_status} ({elapsed}s) | "
+                    f"cmds={self.state['commands_completed']}{files}{recent}")
+        active = f", running={self.state['commands_running']}" if self.state["commands_running"] else ""
+        return (f"[agy-codex {self.run_id}] {self.state['stage']} ({elapsed}s) | "
+                f"cmds={self.state['commands_completed']}{active}{files}{recent}")
+
+    def _flush(self, *, force=False, final_status=None):
+        tick = time.monotonic()
+        self.state["elapsed_seconds"] = int(tick - self.started)
+        self.state["updated_at"] = now()
+        if final_status is not None:
+            self.state["running"] = False
+            self.state["result_status"] = final_status
+        signature = (
+            self.state["stage"], self.state["commands_completed"],
+            self.state["commands_running"], self.state["changed_file_count"],
+            final_status,
+        )
+        should_persist = force or final_status is not None or (tick - self.last_persist >= PERSIST_SECONDS)
+        if should_persist:
+            atomic_json(self.path, self.state)
+            self.last_persist = tick
+        should_print = (
+            final_status is not None
+            or (signature != self.last_signature and (self.last_signature is None or tick - self.last_emit >= self.throttle_seconds))
+        )
+        if should_print and self.stream is not None:
+            try:
+                print(self._line(final_status), file=self.stream, flush=True)
+            except OSError:
+                pass
+            self.last_emit = tick
+            self.last_signature = signature
+
+    def finish(self, status):
+        self._flush(force=True, final_status=status)
 
 
 class ProgressFeed:
@@ -57,8 +153,7 @@ class ProgressFeed:
                 if isinstance(path, str) and path:
                     self.files.add(path)
             self.producer["changed_file_count"] = len(self.files)
-            self.producer["recent_files"] = ["".join(c if c.isprintable() else " " for c in name)[:80]
-                                             for name in sorted(self.files)[-3:]]
+            self.producer["recent_files"] = [_sanitize_name(name) for name in sorted(self.files)[-3:]]
         elif kind == "test":
             self.producer.update(test_index=event["index"], test_result=event["result"])
             if event["result"] == "SKIPPED":
@@ -110,8 +205,6 @@ class ProgressFeed:
         details_due = (self.mode == "detailed" and activity and signature != self.last_signature
                        and (self.last_signature is None or tick - self.last_log >= DETAIL_SECONDS)
                        and self.detail_count < DETAIL_LIMIT)
-        # The first actual validation update is a stage announcement, not a
-        # detail. It remains visible even after a long Worker's detail budget.
         should_log = first_validation or details_due
         if finished is not None:
             should_log = activity
@@ -151,8 +244,6 @@ async def run_controller(controller, method, ticket_id, phase_fn, log_fn, *, pro
         with contextlib.suppress(OSError):
             feed.current.update(running=not job.done(), result_status="STOPPING", updated_at=now())
             atomic_json(feed.path, feed.current)
-        # Retain the workflow lock and callback until real cleanup finishes. A
-        # repeated host cancellation must not strand the owned executor thread.
         while not job.done():
             with contextlib.suppress(Exception, asyncio.CancelledError):
                 await asyncio.shield(job)
