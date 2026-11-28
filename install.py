@@ -70,6 +70,36 @@ def locations(home, project):
     return target, base/"agy-codex-install-backups"
 
 
+def _sync_in_place(stage, target):
+    """Update target directory contents in place when Windows holds a watcher handle on target."""
+    stage_files = {p.relative_to(stage) for p in stage.rglob("*") if p.is_file()}
+    # Remove stale files that are no longer part of the staged plugin.
+    for existing in sorted(target.rglob("*"), reverse=True):
+        if existing.is_file():
+            rel = existing.relative_to(target)
+            if rel not in stage_files:
+                try:
+                    existing.unlink()
+                except OSError:
+                    if "__pycache__" not in rel.parts and existing.suffix != ".pyc":
+                        raise
+        elif existing.is_dir():
+            try:
+                if not any(existing.iterdir()):
+                    existing.rmdir()
+            except OSError:
+                pass
+    # Copy new/updated files; write ownership marker last.
+    marker_rel = Path(MARKER)
+    ordered = [r for r in sorted(stage_files) if r != marker_rel]
+    if marker_rel in stage_files:
+        ordered.append(marker_rel)
+    for rel in ordered:
+        dst = target / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(stage / rel, dst)
+
+
 def install(*, home=None, project=None, uninstall=False):
     target, backup_root = locations(home, project)
     _owned(target)
@@ -102,14 +132,32 @@ def install(*, home=None, project=None, uninstall=False):
         (stage/MARKER).write_text(json.dumps({"package": "agy-codex", "format": "antigravity-native-plugin",
                                             "version": manifest["version"], "files": expected}, indent=2), encoding="utf-8")
         target.parent.mkdir(parents=True, exist_ok=True)
+        in_place = False
         if target.exists():
             backup = backup_root/uuid.uuid4().hex
-            os.replace(target, backup)
+            try:
+                os.replace(target, backup)
+            except PermissionError as exc:
+                if os.name != "nt" or getattr(exc, "winerror", None) not in (None, 5, 32):
+                    raise
+                # Antigravity Desktop on Windows holds a watcher handle on plugins/agy-codex,
+                # blocking top-level rename; back up by copy and sync contents in place.
+                shutil.copytree(target, backup)
+                in_place = True
         try:
-            os.replace(stage, target)
+            if in_place:
+                _sync_in_place(stage, target)
+            else:
+                os.replace(stage, target)
         except OSError:
             if backup:
-                os.replace(backup, target)
+                if in_place:
+                    try:
+                        _sync_in_place(backup, target)
+                    except OSError:
+                        pass
+                else:
+                    os.replace(backup, target)
             raise
         result.update(changed=True, backup=str(backup) if backup else None)
         return result

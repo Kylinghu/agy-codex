@@ -195,6 +195,36 @@ class Slice2SlimmingTests(unittest.TestCase):
         blocked_data = product.review_input(self.f.controller, state, blocked_packet, fresh=True)
         self.assertEqual(blocked_data["worker_report"]["outcome"], "blocked")
 
+    def test_installer_windows_locked_dir_falls_back_to_in_place_sync(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("agy_installer", str(REPO_ROOT / "install.py"))
+        inst = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(inst)
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            first = inst.install(home=home)
+            target = Path(first["plugin"])
+            stale = target / "skills" / "agy-codex" / "scripts" / "obsolete_v02.py"
+            stale.write_text("# stale\n", encoding="utf-8")
+            (target / "plugin.json").write_text('{"name":"agy-codex","version":"0.2.0"}\n', encoding="utf-8")
+
+            orig_replace = inst.os.replace
+            def deny_top_rename(src, dst):
+                if Path(src) == target:
+                    err = PermissionError(13, "Access is denied", str(src), 5)
+                    err.winerror = 5
+                    raise err
+                return orig_replace(src, dst)
+
+            with mock.patch.object(inst.os, "name", "nt"), \
+                 mock.patch.object(inst.os, "replace", side_effect=deny_top_rename):
+                res = inst.install(home=home)
+            self.assertTrue(res["changed"])
+            self.assertIsNotNone(res["backup"])
+            self.assertFalse(stale.exists(), "Stale file should be removed during in-place sync")
+            self.assertEqual(json.loads((target / "plugin.json").read_text(encoding="utf-8"))["version"], "0.3.0")
+            self.assertTrue((Path(res["backup"]) / "skills" / "agy-codex" / "scripts" / "obsolete_v02.py").is_file())
+
 
 class Slice2ModelCatalogCacheTests(unittest.TestCase):
     def setUp(self):
