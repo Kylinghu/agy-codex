@@ -35,7 +35,13 @@ def main():
     def save():
         state_path.write_text(json.dumps(state), encoding="utf-8")
     def thread():
-        return {"id": state.get("id"), "status": {"type": "notLoaded" if mode.get("not_loaded") and not loaded else "idle"}, "turns": state.get("turns", [])}
+        return {
+            "id": state.get("id"),
+            "cwd": mode.get("thread_cwd") or state.get("cwd"),
+            "modelProvider": mode.get("provider", state.get("provider", "openai")),
+            "status": {"type": "notLoaded" if mode.get("not_loaded") and not loaded else "idle"},
+            "turns": state.get("turns", []),
+        }
     def finish(rid, params):
         tid = str(uuid.uuid4())
         report = {"outcome": "done", "summary": "Fixture implementation",
@@ -109,7 +115,7 @@ def main():
                 "secondary": {"usedPercent": 29, "windowDurationMins": 10080}, "planType": "plus"}})
         elif method in ("thread/start", "thread/resume"):
             if method == "thread/start":
-                state = {"id": str(uuid.uuid4()), "turns": []}
+                state = {"id": str(uuid.uuid4()), "cwd": params.get("cwd"), "provider": mode.get("provider", "openai"), "turns": []}
                 save()
             elif params.get("threadId") != state.get("id"):
                 error(rid, -32600, "bad thread")
@@ -118,9 +124,23 @@ def main():
             response(rid, {"thread": thread(), "model": params.get("model", "fixture-model"),
                             "modelProvider": mode.get("provider", "openai"), "reasoningEffort": "low"})
         elif method == "thread/read":
-            response(rid, {"thread": thread()})
+            if params.get("threadId") != state.get("id"):
+                response(rid, {"thread": None})
+            else:
+                t = thread()
+                if not params.get("includeTurns", True):
+                    t = {k: v for k, v in t.items() if k != "turns"}
+                response(rid, {"thread": t})
         elif method == "thread/turns/list":
-            response(rid, {"data": state.get("turns", [])})
+            turns = list(state.get("turns", []))
+            page_size = mode.get("turns_page_size")
+            if isinstance(page_size, int) and page_size > 0:
+                offset = int(params.get("cursor") or 0)
+                chunk = turns[offset:offset + page_size]
+                next_cursor = str(offset + page_size) if offset + page_size < len(turns) else None
+                response(rid, {"data": chunk, "nextCursor": next_cursor})
+            else:
+                response(rid, {"data": turns, "nextCursor": None})
         elif method == "turn/start":
             if params.get("threadId") != state.get("id"):
                 return 64

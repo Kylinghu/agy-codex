@@ -340,9 +340,13 @@ def plugin_state_root():
     return (Path.home() / ".gemini" / "config" / "agy-codex").resolve()
 
 
+def _mutex_base():
+    """Stable host-local mutex root, independent of AGY_CODEX_STATE_DIR."""
+    return (Path.home() / ".gemini" / "config" / "agy-codex" / "mutex").resolve()
+
+
 def _registry_root():
-    # Use the same global registry root unless explicitly overridden for isolated tests.
-    return plugin_state_root()
+    return _mutex_base()
 
 
 def norm_path_key(path):
@@ -391,11 +395,30 @@ def resolve_workspace(cwd="."):
     except (WorkflowError, OSError, subprocess.SubprocessError):
         path_hash = hashlib.sha256(norm_path_key(candidate).encode("utf-8")).hexdigest()[:16]
         state_dir = plugin_state_root() / "workspaces" / path_hash
+        lock_path = _mutex_base() / "locks" / f"{path_hash}.lock"
         return Workspace(
             cwd=candidate, root_path=candidate, git_dir=None,
-            state_dir=state_dir, lock_path=state_dir / "workspace.lock",
+            state_dir=state_dir, lock_path=lock_path,
             workspace_key="dir:" + path_hash, is_git=False,
         )
+
+
+def thread_cwd_matches_workspace(ws, thread_cwd):
+    """Verify a native Thread's recorded cwd belongs to this workspace (Git worktree or exact non-Git root)."""
+    if not isinstance(thread_cwd, str) or not thread_cwd.strip():
+        return False
+    tcwd = Path(thread_cwd).expanduser().resolve()
+    if ws.is_git:
+        if tcwd.exists():
+            try:
+                top = Path(git(tcwd, "rev-parse", "--show-toplevel").decode().strip()).resolve()
+                return norm_path_key(top) == norm_path_key(ws.root_path)
+            except (WorkflowError, OSError, subprocess.SubprocessError):
+                return False
+        # If the historical subdir was later deleted, fall back to component containment inside ws.root_path.
+        rp, tp = _norm_parts(ws.root_path), _norm_parts(tcwd)
+        return bool(rp) and len(tp) >= len(rp) and tp[:len(rp)] == rp
+    return norm_path_key(tcwd) == norm_path_key(ws.root_path)
 
 
 def _persist_workspace_meta(ws):
@@ -427,26 +450,36 @@ def _check_strict_occupancy(ws):
                     f"Worktree is reserved by active Strict Ticket {tstate['id']} ({tstate.get('status')}). "
                     "Continue, resolve, or close it before starting a lightweight write run."
                 )
+    plans_dir = ws.state_dir / "plans"
+    candidate_plans = []
     plan_ptr = ws.state_dir / "active-plan.json"
     if plan_ptr.exists():
         plan_id = read_json(plan_ptr).get("plan_id")
-        ppath = ws.state_dir / "plans" / str(plan_id) / "plan.json" if plan_id else None
-        if ppath and ppath.is_file():
-            plan = read_json(ppath)
-            if not plan.get("stopped"):
-                for entry in plan.get("tasks", []):
-                    tpath = ws.state_dir / "tickets" / entry["ticket_id"] / "ticket.json"
-                    if not tpath.is_file() or read_json(tpath).get("status") != "PASS":
-                        raise WorkflowError(
-                            f"Worktree is reserved by unfinished Strict Plan {plan['id']}. "
-                            "Continue or explicitly stop that plan before starting a lightweight write run."
-                        )
+        if plan_id:
+            ppath = plans_dir / str(plan_id) / "plan.json"
+            if ppath.is_file():
+                candidate_plans.append(ppath)
+    if plans_dir.is_dir():
+        for ppath in sorted(plans_dir.glob("*/plan.json")):
+            if ppath not in candidate_plans:
+                candidate_plans.append(ppath)
+    for ppath in candidate_plans:
+        plan = read_json(ppath)
+        if not plan.get("stopped"):
+            for entry in plan.get("tasks", []):
+                tpath = ws.state_dir / "tickets" / entry["ticket_id"] / "ticket.json"
+                if not tpath.is_file() or read_json(tpath).get("status") != "PASS":
+                    raise WorkflowError(
+                        f"Worktree is reserved by unfinished Strict Plan {plan['id']}. "
+                        "Continue or explicitly stop that plan before starting a lightweight write run."
+                    )
 
 
 @contextlib.contextmanager
-def acquire_writer_lease(ws, run_id, *, sandbox="workspace-write", allow_strict=False, already_locked=False):
+def acquire_writer_lease(ws, run_id, *, sandbox="workspace-write", allow_strict=False,
+                         already_locked=False, already_registered=False):
     """Atomic single-writer lease across Git and non-Git workspaces, guarding ancestor/descendant overlap."""
-    if sandbox == "read-only":
+    if sandbox == "read-only" or already_registered:
         yield
         return
     reg_root = _registry_root()
@@ -636,7 +669,7 @@ def list_runs(ws, *, owner_kind=None, limit=20):
         if owner_kind and data.get("owner_kind") != owner_kind:
             continue
         items.append(data)
-    items.sort(key=lambda r: (r.get("started_at", ""), r.get("run_id", "")), reverse=True)
+    items.sort(key=lambda r: (r.get("started_ns", 0), r.get("started_at", ""), r.get("run_id", "")), reverse=True)
     return items[:limit] if limit else items
 
 
@@ -665,7 +698,7 @@ def _ensure_reconcilable_chain(ws, runs_for_thread):
 def resolve_resume(ws, resume_spec, *, requested_provider=None):
     """Resolve --resume <RUN_ID|THREAD_ID|last> with strict lineage and provenance checks."""
     if not resume_spec:
-        return {"thread_id": None, "continued_from": None, "prior_provider": None}
+        return {"thread_id": None, "continued_from": None, "prior_provider": None, "external": False}
     if not isinstance(resume_spec, str) or not resume_spec.strip():
         raise WorkflowError("Resume target must be a nonempty Run ID, Thread ID, or 'last'.")
     target = resume_spec.strip()
@@ -685,7 +718,8 @@ def resolve_resume(ws, resume_spec, *, requested_provider=None):
         prior_provider = run.get("model_provider")
         if prior_provider and requested_provider not in (None, prior_provider):
             raise WorkflowError("Cannot change provider inside an existing Session.")
-        return {"thread_id": run["thread_id"], "continued_from": run["run_id"], "prior_provider": prior_provider}
+        return {"thread_id": run["thread_id"], "continued_from": run["run_id"],
+                "prior_provider": prior_provider, "external": False}
 
     if target == "last":
         if not all_runs:
@@ -707,8 +741,8 @@ def resolve_resume(ws, resume_spec, *, requested_provider=None):
     if by_thread:
         return _validate_run(by_thread[0])
 
-    # External native Thread ID: backend thread/resume will verify cwd, idle status, and provider allowlist.
-    return {"thread_id": target, "continued_from": None, "prior_provider": requested_provider}
+    # External native Thread ID: App Server must verify original cwd, idle status, and provider allowlist.
+    return {"thread_id": target, "continued_from": None, "prior_provider": requested_provider, "external": True}
 
 
 def make_run_id():
@@ -721,6 +755,8 @@ def reconcile_run(ws, run_id, *, codex_cmd=None, timeout=30, cancel=None,
     state = load_run(ws, run_id)
     if state.get("host") and state["host"] != socket.gethostname():
         raise WorkflowError("Recovery requires the original host to verify the worker process.")
+    if state.get("codex_home") and state["codex_home"] != current_codex_home():
+        raise WorkflowError("Recovery requires the original CODEX_HOME to reconcile the saved Thread.")
     if pid_alive(state.get("child_pid"), process_group=os.name != "nt"):
         raise WorkflowError("The saved worker/process group is still alive. No replacement was started.")
 
@@ -796,6 +832,7 @@ def execute_run(
     round_number=1,
     allow_strict=False,
     already_locked=False,
+    already_registered=False,
     update_latest=True,
     supplement_prompt_builder=None,
     queue_turns=0,
@@ -820,12 +857,20 @@ def execute_run(
     else:
         backend = cfg.get("backend", "exec" if codex_cmd else "auto")
 
+    external_thread = False
     if resume is not None:
         resolved = resolve_resume(ws, resume, requested_provider=requested.get("model_provider"))
         session_id = resolved["thread_id"]
         continued_from = resolved["continued_from"]
+        external_thread = bool(resolved.get("external"))
         if resolved["prior_provider"] and not prior_provider:
             prior_provider = resolved["prior_provider"]
+
+    if external_thread and backend == "exec":
+        raise WorkflowError(
+            "Cannot safely resume an unregistered external Thread ID via exec backend "
+            "without native Thread workspace/provider verification; use app-server."
+        )
 
     if prior_provider:
         if requested.get("model_provider") not in (None, prior_provider):
@@ -850,7 +895,9 @@ def execute_run(
         "owner_kind": owner_kind,
         "ticket_id": ticket_id,
         "round": round_number,
-        "thread_id": session_id,
+        # Do not bind an unverified external Thread ID onto this workspace until verified by App Server.
+        "thread_id": None if external_thread else session_id,
+        "requested_external_thread_id": session_id if external_thread else None,
         "continued_from": continued_from,
         "workspace_key": ws.workspace_key,
         "cwd": str(ws.root_path),
@@ -876,6 +923,7 @@ def execute_run(
         "usage": {},
         "error": None,
         "started_at": now(),
+        "started_ns": time.time_ns(),
         "ended_at": None,
         "elapsed_seconds": 0,
     }
@@ -901,7 +949,10 @@ def execute_run(
         schema_path = artifact_dir / "worker-schema.json"
         atomic_json(schema_path, output_schema)
 
-    with acquire_writer_lease(ws, run_id, sandbox=sandbox, allow_strict=allow_strict, already_locked=already_locked):
+    with acquire_writer_lease(
+        ws, run_id, sandbox=sandbox, allow_strict=allow_strict,
+        already_locked=already_locked, already_registered=already_registered,
+    ):
         (artifact_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
         _save("run_started")
         if update_latest:
@@ -951,10 +1002,15 @@ def execute_run(
                         sandbox=sandbox, output_schema=output_schema,
                         timeout=timeout, cancel=cancel,
                         supplement_prompt_builder=supplement_prompt_builder,
+                        verify_external_thread=external_thread,
                     )
                 except codex_app_server.StartupUnavailable as exc:
                     if backend != "auto" or state.get("turn_pending"):
                         raise
+                    if external_thread:
+                        raise WorkflowError(
+                            "App Server unavailable; refusing to fall back to exec for an unverified external Thread ID."
+                        ) from exc
                     if policy(ws.state_dir)["allowed_providers"]:
                         verify_provider(ws.state_dir, requested.get("model_provider"))
                     atomic_json(artifact_dir / "backend-fallback.json", {

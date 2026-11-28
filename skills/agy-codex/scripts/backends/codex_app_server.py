@@ -246,7 +246,8 @@ def _default_supplement_prompt(queued, has_schema):
 
 def run(ws, state, save_fn, launcher, requested, artifact_dir, inbox_target,
         prompt, on_line, *, sandbox="workspace-write", output_schema=None,
-        timeout=900, cancel=None, supplement_prompt_builder=None):
+        timeout=900, cancel=None, supplement_prompt_builder=None,
+        verify_external_thread=False):
     from routing import verify_provider
     from backends.usage import RoundUsage
     import inbox
@@ -268,12 +269,30 @@ def run(ws, state, save_fn, launcher, requested, artifact_dir, inbox_target,
             "backend": "app-server", "argv": rpc.argv, "cwd": str(ws.root_path),
             "sandbox": sandbox, "started_at": now(), "codex_requested": requested,
         })
+        existing_tid = state.get("thread_id") or state.get("requested_external_thread_id")
+        if existing_tid and verify_external_thread:
+            meta = rpc.call("thread/read", {"threadId": existing_tid, "includeTurns": False}, timeout=20).get("thread") or {}
+            if meta.get("id") != existing_tid:
+                raise WorkflowError("External Thread ID was not found or returned a mismatched Thread.")
+            orig_cwd = meta.get("cwd")
+            if not runtime.thread_cwd_matches_workspace(ws, orig_cwd):
+                raise WorkflowError(
+                    f"External Thread belongs to a different workspace ({orig_cwd}); refusing cross-workspace resume."
+                )
+            meta_status = (meta.get("status") or {}).get("type")
+            if meta_status not in ("idle", "notLoaded"):
+                raise WorkflowError(f"External Thread is not idle (status={meta_status}); refusing resume.")
+            meta_provider = meta.get("modelProvider")
+            if meta_provider:
+                if requested.get("model_provider") not in (None, meta_provider):
+                    raise WorkflowError("External Thread provider differs from requested provider.")
+                verify_provider(ws.state_dir, meta_provider)
+
         params = {"cwd": str(ws.root_path), "sandbox": sandbox, "approvalPolicy": "never"}
         if requested.get("model"):
             params["model"] = requested["model"]
         if requested.get("model_provider"):
             params["modelProvider"] = requested["model_provider"]
-        existing_tid = state.get("thread_id")
         method = "thread/resume" if existing_tid else "thread/start"
         if existing_tid:
             params["threadId"] = existing_tid
@@ -285,6 +304,9 @@ def run(ws, state, save_fn, launcher, requested, artifact_dir, inbox_target,
             raise WorkflowError("App Server returned no Thread ID.")
         if existing_tid and existing_tid != thread_id:
             raise WorkflowError("Resumed App Server returned a different Session ID.")
+        if existing_tid and verify_external_thread and thread.get("cwd"):
+            if not runtime.thread_cwd_matches_workspace(ws, thread.get("cwd")):
+                raise WorkflowError("Resumed external Thread cwd does not match this workspace.")
         if existing_tid and (thread.get("status") or {}).get("type") != "idle":
             idle = rpc.call("thread/read", {"threadId": thread_id, "includeTurns": False}).get("thread") or {}
             if (idle.get("status") or {}).get("type") != "idle":
@@ -479,6 +501,28 @@ def run(ws, state, save_fn, launcher, requested, artifact_dir, inbox_target,
                 return 0
 
 
+def _find_turn_paginated(rpc, thread_id, active_turn, fallback_turns=None, *, max_pages=50):
+    """Page through thread/turns/list using nextCursor; stop immediately when active_turn is found."""
+    cursor = None
+    seen = set()
+    for _ in range(max_pages):
+        params = {"threadId": thread_id, "itemsView": "full"}
+        if cursor is not None:
+            params["cursor"] = cursor
+        page = rpc.call("thread/turns/list", params)
+        turns = page.get("data") or []
+        turn = next((t for t in turns if t.get("id") == active_turn), None)
+        if turn is not None:
+            return turn
+        cursor = page.get("nextCursor")
+        if not cursor:
+            break
+        if cursor in seen:
+            raise WorkflowError("App Server thread/turns/list pagination did not terminate.")
+        seen.add(cursor)
+    return next((t for t in (fallback_turns or []) if t.get("id") == active_turn), None)
+
+
 def reconcile_run(ws, state, save_fn, artifact_dir, inbox_target, *,
                   codex_cmd=None, timeout=30, cancel=None):
     """Read-only recovery for an ambiguous Turn; never blindly replays."""
@@ -509,8 +553,7 @@ def reconcile_run(ws, state, save_fn, artifact_dir, inbox_target, *,
             thread = rpc.call("thread/read", {"threadId": thread_id, "includeTurns": False}).get("thread") or {}
         if thread.get("id") != thread_id or (thread.get("status") or {}).get("type") != "idle":
             raise WorkflowError("Saved App Server Thread is not confirmed idle.")
-        turns = rpc.call("thread/turns/list", {"threadId": thread_id}).get("data") or thread.get("turns") or []
-        turn = next((t for t in turns if t.get("id") == active_turn), None)
+        turn = _find_turn_paginated(rpc, thread_id, active_turn, thread.get("turns"))
         if not turn or turn.get("status") not in ("completed", "failed", "interrupted"):
             raise WorkflowError("Saved Turn has no confirmed terminal outcome.")
         if turn["status"] == "completed":

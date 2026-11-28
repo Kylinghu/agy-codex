@@ -412,34 +412,36 @@ class Controller:
             )
 
             try:
-                run_state, summary_data = runtime.execute_run(
-                    ws, prompt,
-                    run_id=run_id,
-                    artifact_dir=directory,
-                    inbox_dir=self.ticket_dir(ticket_id) / "inbox",
-                    inbox_target=ticket_inbox,
-                    session_id=state["session_id"],
-                    prior_provider=prior_provider,
-                    codex=requested,
-                    backend_override=backend,
-                    sandbox="workspace-write",
-                    output_schema=WORKER_SCHEMA,
-                    codex_cmd=launcher,
-                    timeout=self.timeout,
-                    cancel=self.cancel,
-                    on_progress=on_progress,
-                    on_state_sync=on_sync,
-                    owner_kind="strict",
-                    ticket_id=ticket_id,
-                    round_number=state["round"],
-                    allow_strict=True,
-                    already_locked=True,
-                    update_latest=False,
-                    supplement_prompt_builder=strict_supplement,
-                    queue_turns=state.get("queue_turns", 0),
-                )
-                if run_state["status"] == "completed":
-                    return self._prepare_review(state)
+                with runtime.acquire_writer_lease(ws, run_id, allow_strict=True, already_locked=True):
+                    run_state, summary_data = runtime.execute_run(
+                        ws, prompt,
+                        run_id=run_id,
+                        artifact_dir=directory,
+                        inbox_dir=self.ticket_dir(ticket_id) / "inbox",
+                        inbox_target=ticket_inbox,
+                        session_id=state["session_id"],
+                        prior_provider=prior_provider,
+                        codex=requested,
+                        backend_override=backend,
+                        sandbox="workspace-write",
+                        output_schema=WORKER_SCHEMA,
+                        codex_cmd=launcher,
+                        timeout=self.timeout,
+                        cancel=self.cancel,
+                        on_progress=on_progress,
+                        on_state_sync=on_sync,
+                        owner_kind="strict",
+                        ticket_id=ticket_id,
+                        round_number=state["round"],
+                        allow_strict=True,
+                        already_locked=True,
+                        already_registered=True,
+                        update_latest=False,
+                        supplement_prompt_builder=strict_supplement,
+                        queue_turns=state.get("queue_turns", 0),
+                    )
+                    if run_state["status"] == "completed":
+                        return self._prepare_review(state)
                 completed_worker = (
                     summary_data.get("exit_code") == 0 and summary_data.get("completed")
                     and not summary_data.get("failed") and not summary_data.get("invalid_lines")
@@ -659,7 +661,8 @@ class Controller:
                 raise WorkflowError("Refresh is only valid for a pending review.")
             state["runner_pid"] = os.getpid()
             self.save(state, "review_refresh_started")
-            return self._prepare_review(state)
+            with runtime.acquire_writer_lease(self.workspace, f"{ticket_id}-refresh", allow_strict=True, already_locked=True):
+                return self._prepare_review(state)
 
     def verdict(self, ticket_id, review, source="manual"):
         with worktree_lock(self.lock):
@@ -829,7 +832,8 @@ class Controller:
                     state.update(child_pid=None, runner_pid=os.getpid(), recoverable_interruption=True)
                     self.save(state, "completed_worker_recovered")
                     try:
-                        return self._prepare_review(state)
+                        with runtime.acquire_writer_lease(ws, f"{ticket_id}-recover", allow_strict=True, already_locked=True):
+                            return self._prepare_review(state)
                     except (Exception, KeyboardInterrupt) as exc:
                         return self._escalate(state, str(exc) or type(exc).__name__, recoverable=True)
             if not state["session_id"] or not (state.get("child_pid") or state.get("last_child_pid")):

@@ -96,7 +96,7 @@ class ProtocolTests(unittest.TestCase):
 
         clock = SimpleNamespace(
             monotonic=lambda: time.monotonic() + (self.controller.timeout + 1 if bound else 0),
-            strftime=time.strftime, gmtime=time.gmtime,
+            strftime=time.strftime, gmtime=time.gmtime, time_ns=time.time_ns,
         )
         with mock.patch.object(sa.runtime, "time", clock), mock.patch.object(self.controller, "save", side_effect=save):
             return self.controller.run(ticket_id or self.ticket_id)

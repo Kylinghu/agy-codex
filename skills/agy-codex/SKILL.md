@@ -23,7 +23,8 @@ Resolve `SKILL_DIR` from this `SKILL.md` location and use a verified Python 3.10
 
 ## 2. Goal-Oriented Delegation, Context Reuse & Worker Principles
 
-- **Separate facts from hypotheses**: When delegating, distinguish (1) User goal, constraints, and acceptance expectations, (2) Observed facts with file/symbol/line/page references, (3) Unverified hypotheses, and (4) Optional suggestions. Keep simple tasks short—no mandatory forms, plans, or JSON schemas.
+- **Separate facts from hypotheses (semantic rule, not a fixed form)**: Keep clear small tasks to 1–2 natural sentences—never force a 4-section template or pre-scan the whole repo. When facts, guesses, and suggestions could be confused and affect the outcome, explicitly label unverified hypotheses vs. observed facts (with file/line/source pointers), and never present a model guess as a user requirement.
+- **Stop-loss on autonomous continuation**: Aim to finish in one run. Continue only when concrete authorized work remains with a viable path. If two consecutive same-direction resumes yield no observable new progress (verified/eliminated root cause, actual fix, passing check, or usable artifact) or oscillate, stop repeating; pivot once only if new evidence points to a meaningfully different approach, otherwise deliver usable artifacts and the concrete obstacle. Never pad turns mechanically or stop mid-progress on an artificial round count.
 - **Progressive context (L0→L3)**: Do not read an entire repository before delegating an ordinary code task. Pass references and deltas rather than pasting full files. On `--resume`, send only new requirements, facts, or corrections—never repeat the full initial brief or worker principles block.
 - **Cognitive independence & isolated review**: Reuse facts without inheriting bias. When an independent review has genuine value, start a **fresh** `user_cli.py run --read-only` context, supply the original goal, constraints, actual diff/artifacts, and raw evidence first, and let the reviewer form an independent judgment before reading the writer's self-explanation. A main-agent check after reading Worker conclusions is not an independent review.
 
@@ -78,7 +79,7 @@ Both `--cwd` and `--repo` are accepted across all commands (Git and non-Git work
 
 - Pick a tier sufficient for the task (`--tier economy|standard|heavy` or explicit `--model` / `--effort`); do not default to `heavy` for routine edits or mechanical formatting. Query `user_cli.py models --json` only when needed, honor explicit user requests and `allowed_providers`, and never edit Codex global config.
 - Reuse project `AGENTS.md`, domain Skills (HWB, Office, etc.), and MCP tools. When a task specifically depends on Office libraries (`python-docx`, `openpyxl`, etc.), probe once upfront rather than building a global startup gate or letting Codex hand-roll fragile OOXML.
-- Under Windows `workspace-write` sandbox, Office COM (`0x80080005`) is unavailable; do not loop retrying COM or auto-escalate permissions. Separate artifact defects, validation failures, and validation environment limits.
+- Office COM restrictions (such as `0x80080005`) have been observed under Windows sandboxes; if actually encountered, do not blindly retry COM loops or auto-escalate permissions. Separate artifact defects, validation failures, and validation environment limits.
 - `status: "completed"` means the Codex Turn ended, not that the user's objective or checks passed. Verify proportionately, continue autonomously if authorized work remains, and report measured Codex usage separately from unavailable AGY usage.
 
 Load `references/host.md`, `references/planning.md`, or `references/handoff.md` only when using Strict Workflow or recovering a legacy Ticket.

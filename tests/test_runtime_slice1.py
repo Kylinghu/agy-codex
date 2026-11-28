@@ -29,6 +29,7 @@ class Slice1RuntimeTests(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="agy-s1-")).resolve()
         self.addCleanup(lambda: sa.shutil.rmtree(self.tmp, ignore_errors=True))
         self.state_root = self.tmp / "state-root"
+        self.mutex_root = self.tmp / "mutex-root"
         self.global_cfg = self.tmp / "global-config.json"
         self.fake_ctrl_dir = self.tmp / "fake-ctrl"
         self.fake_ctrl_dir.mkdir(parents=True, exist_ok=True)
@@ -42,6 +43,9 @@ class Slice1RuntimeTests(unittest.TestCase):
         })
         env.start()
         self.addCleanup(env.stop)
+        mp = mock.patch.object(runtime, "_mutex_base", return_value=self.mutex_root)
+        mp.start()
+        self.addCleanup(mp.stop)
         self.configure(backend="app-server")
 
     def configure(self, **data):
@@ -288,6 +292,148 @@ class Slice1RuntimeTests(unittest.TestCase):
                 mock.patch.object(sa, "resolve_codex", return_value=["codex-double"]):
             rc_doc = user_cli.main(["--cwd", str(doc_dir), "doctor", "--json"])
             self.assertEqual(rc_doc, 0)
+
+    def test_external_thread_rejects_cross_workspace_and_exec_unverified(self):
+        dir_a = self.make_nongit("ws-a")
+        dir_b = self.make_nongit("ws-b")
+        ws_a = runtime.resolve_workspace(dir_a)
+        ws_b = runtime.resolve_workspace(dir_b)
+
+        first, _ = runtime.execute_run(ws_a, "Start in ws-a.", codex_cmd=[sys.executable, str(FAKE_APP)], timeout=15)
+        self.assertEqual(first["status"], "completed")
+        ext_tid = first["thread_id"]
+
+        # Resuming ws-a's Thread from ws-b must fail at thread/read cwd check before thread/resume or turn/start.
+        before_resumes = len(self.calls("thread/resume"))
+        before_turns = len(self.calls("turn/start"))
+        bad, _ = runtime.execute_run(
+            ws_b, "Cross-workspace resume attempt.", resume=ext_tid,
+            codex_cmd=[sys.executable, str(FAKE_APP)], timeout=15,
+        )
+        self.assertEqual(bad["status"], "failed")
+        self.assertIn("different workspace", bad["error"])
+        self.assertEqual(len(self.calls("thread/resume")), before_resumes)
+        self.assertEqual(len(self.calls("turn/start")), before_turns)
+
+        # Unregistered external Thread on exec backend must be rejected upfront.
+        with self.assertRaisesRegex(runtime.WorkflowError, "external Thread ID via exec"):
+            runtime.execute_run(
+                ws_b, "Exec external resume.", resume=ext_tid, backend_override="exec",
+                codex_cmd=[sys.executable, str(FAKE_APP)], timeout=15,
+            )
+
+        # External Thread belonging to the same Git worktree (created in a subdir) is accepted.
+        repo = self.make_git_repo("git-ext")
+        sub = repo / "pkg"
+        sub.mkdir()
+        fake_thread = {"id": "ext-git-thread-1", "cwd": str(sub), "provider": "openai", "turns": []}
+        runtime.atomic_json(self.fake_ctrl_dir / "fake-app-thread.json", fake_thread)
+        ws_git = runtime.resolve_workspace(repo)
+        ok_run, _ = runtime.execute_run(
+            ws_git, "Resume valid external git thread.", resume="ext-git-thread-1",
+            codex_cmd=[sys.executable, str(FAKE_APP)], timeout=15,
+        )
+        self.assertEqual(ok_run["status"], "completed", ok_run)
+        self.assertEqual(ok_run["thread_id"], "ext-git-thread-1")
+
+    def test_reconcile_verifies_codex_home_and_paginates_turns_list(self):
+        doc_dir = self.make_nongit("paginate-reconcile")
+        ws = runtime.resolve_workspace(doc_dir)
+        self.mode(ambiguous=True, not_loaded=True)
+        amb, _ = runtime.execute_run(
+            ws, "Ambiguous run.", codex_cmd=[sys.executable, str(FAKE_APP)], timeout=15,
+        )
+        self.assertEqual(amb["status"], "unknown")
+        self.assertTrue(amb["turn_pending"])
+
+        # Reconcile under a different CODEX_HOME must be rejected.
+        other_home = self.tmp / "other-codex-home"
+        other_home.mkdir()
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(other_home)}):
+            with self.assertRaisesRegex(runtime.WorkflowError, "original CODEX_HOME"):
+                runtime.reconcile_run(ws, amb["run_id"], codex_cmd=[sys.executable, str(FAKE_APP)])
+
+        # Insert an unrelated filler turn ahead of active_turn_id and force page_size=1 so target is on page 2.
+        tpath = self.fake_ctrl_dir / "fake-app-thread.json"
+        tdata = runtime.read_json(tpath)
+        tdata["turns"].insert(0, {"id": "filler-turn-page-1", "status": "completed", "error": None, "items": []})
+        runtime.atomic_json(tpath, tdata)
+        self.mode(not_loaded=True, turns_page_size=1)
+
+        before_list_calls = len(self.calls("thread/turns/list"))
+        reconciled = runtime.reconcile_run(ws, amb["run_id"], codex_cmd=[sys.executable, str(FAKE_APP)])
+        self.assertEqual(reconciled["status"], "completed", reconciled)
+        self.assertFalse(reconciled["turn_pending"])
+        # Must have fetched at least 2 pages using nextCursor.
+        list_calls = self.calls("thread/turns/list")[before_list_calls:]
+        self.assertGreaterEqual(len(list_calls), 2)
+        self.assertEqual(list_calls[1]["params"].get("cursor"), "1")
+
+    def test_distinct_state_dirs_cannot_bypass_mutex_and_strict_validation_holds_overlap_lease(self):
+        doc_dir = self.make_nongit("shared-mutex-dir")
+        state_a = self.tmp / "state-A"
+        state_b = self.tmp / "state-B"
+        with mock.patch.dict(os.environ, {"AGY_CODEX_STATE_DIR": str(state_a)}):
+            ws_a = runtime.resolve_workspace(doc_dir)
+        with mock.patch.dict(os.environ, {"AGY_CODEX_STATE_DIR": str(state_b)}):
+            ws_b = runtime.resolve_workspace(doc_dir)
+        self.assertNotEqual(ws_a.state_dir, ws_b.state_dir)
+        self.assertEqual(ws_a.lock_path, ws_b.lock_path)
+        with runtime.acquire_writer_lease(ws_a, "RUN-STATE-A"):
+            with self.assertRaisesRegex(runtime.WorkflowError, "Overlapping workspace"):
+                with runtime.acquire_writer_lease(ws_b, "RUN-STATE-B"):
+                    pass
+
+        # Strict validation window must hold overlap lease against a non-Git parent directory writer.
+        parent = self.make_nongit("parent-of-git")
+        repo = self.make_git_repo("parent-of-git/nested-repo")
+        ready = repo / ".git" / "val-ready"
+        release = repo / ".git" / "val-release"
+        wait_cmd = (
+            "from pathlib import Path; import time; "
+            f"Path({str(ready)!r}).write_text('1'); "
+            "dl = time.monotonic() + 15\n"
+            f"while not Path({str(release)!r}).exists() and time.monotonic() < dl: time.sleep(0.02)\n"
+            f"assert Path({str(release)!r}).exists()"
+        )
+        c = sa.Controller(repo, codex_cmd=[sys.executable, str(FAKE_APP)], timeout=20)
+        c.create({
+            "id": "STRICT-VAL", "title": "Hold validation", "goal": "Verify lease during validation.",
+            "acceptance": ["Validation blocks overlapping parent write"], "allowed_paths": ["value.py"],
+            "test_commands": [["{python}", "-c", wait_cmd]],
+        })
+        ws_parent = runtime.resolve_workspace(parent)
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self.addCleanup(pool.shutdown, wait=True)
+        fut = pool.submit(c.run, "STRICT-VAL")
+        try:
+            dl = time.monotonic() + 12
+            while not ready.exists() and time.monotonic() < dl:
+                time.sleep(0.02)
+            self.assertTrue(ready.exists(), "Strict validation did not start")
+            with self.assertRaisesRegex(runtime.WorkflowError, "Overlapping workspace"):
+                with runtime.acquire_writer_lease(ws_parent, "RUN-PARENT-RACE"):
+                    pass
+        finally:
+            release.write_text("go", encoding="utf-8")
+        st = fut.result(timeout=20)
+        self.assertEqual(st["status"], "REVIEW", st)
+        # Once Strict run finishes and enters REVIEW, parent directory lease is free again.
+        with runtime.acquire_writer_lease(ws_parent, "RUN-PARENT-AFTER"):
+            pass
+
+    def test_unpublished_strict_plan_manifest_blocks_lightweight_write(self):
+        repo = self.make_git_repo("unpublished-plan-repo")
+        c = sa.Controller(repo, codex_cmd=[sys.executable, str(FAKE_APP)], timeout=15)
+        # Write a non-stopped plan manifest WITHOUT active-plan.json pointer.
+        runtime.atomic_json(c.root / "plans" / "PLAN-UNPUB" / "plan.json", {
+            "id": "PLAN-UNPUB", "title": "Unpublished", "stopped": False,
+            "tasks": [{"key": "T-01", "ticket_id": "PLAN-UNPUB-001", "task": {"title": "Step 1"}}],
+        })
+        ws = runtime.resolve_workspace(repo)
+        with self.assertRaisesRegex(runtime.WorkflowError, "unfinished Strict Plan"):
+            runtime.execute_run(ws, "Try write while unpublished plan exists.",
+                                codex_cmd=[sys.executable, str(FAKE_APP)], timeout=15)
 
 
 if __name__ == "__main__":
