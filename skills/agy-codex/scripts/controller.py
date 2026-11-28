@@ -247,8 +247,24 @@ class Controller:
             previous_paths = self._active_snapshot_paths()
             snapshot_paths = sorted(set(previous_paths) | self._explicit_file_paths(scope))
             snap = self.snapshot(snapshot_paths)
-            if expected_sha256 is not None and self.snapshot(previous_paths)["sha256"] != expected_sha256:
-                raise WorkflowError("Worktree changed between plan steps; inspect the change before starting the next task.")
+            if expected_sha256 is not None:
+                if snapshot_paths == previous_paths:
+                    prev_sha = snap["sha256"]
+                else:
+                    # Project previous_paths view from snap in memory instead of re-hashing the whole repo.
+                    added_explicit = set(snapshot_paths) - set(previous_paths)
+                    if added_explicit:
+                        payload = b"\0".join(os.fsencode(x) for x in sorted(added_explicit)) + b"\0"
+                        ignored_raw = git(self.repo, "check-ignore", "--stdin", "-z",
+                                          allowed=(0, 1), input_bytes=payload)
+                        ignored_added = {os.fsdecode(x) for x in ignored_raw.split(b"\0") if x}
+                    else:
+                        ignored_added = set()
+                    prev_files = {k: v for k, v in snap["files"].items() if k not in ignored_added}
+                    prev_value = {"head": snap["head"], "index_sha256": snap["index_sha256"], "files": prev_files}
+                    prev_sha = hashlib.sha256(encode(prev_value).encode()).hexdigest()
+                if prev_sha != expected_sha256:
+                    raise WorkflowError("Worktree changed between plan steps; inspect the change before starting the next task.")
             state = {"schema_version": 2, "baseline_format": "files-v1", "id": ticket_id, "spec": spec, "status": "READY", "round": 0,
                      "snapshot_paths": snapshot_paths,
                      "max_rounds": limit, "codex_requested": worker_config, "session_id": None, "worktree": str(self.repo), "git_dir": str(self.gitdir),
@@ -258,9 +274,9 @@ class Controller:
                      "reason": None, "resolutions": [], "resolution_allowed": False}
             directory.mkdir(parents=True)
             try:
-                self._capture_files(snap, directory / "baseline-files", [n for n in snap["files"] if self._in_scope(n, scope)])
-                if self.snapshot(snapshot_paths)["sha256"] != snap["sha256"]:
-                    raise WorkflowError("Worktree changed while capturing the task baseline; retry after the other writer finishes.")
+                scoped_names = [n for n in snap["files"] if self._in_scope(n, scope)]
+                # _capture_files verifies each copied file's SHA-256 against snap under worktree_lock.
+                self._capture_files(snap, directory / "baseline-files", scoped_names)
                 atomic_json(directory / "baseline.json", snap)
                 atomic_json(directory / "contract.json", spec)
             except Exception:
@@ -621,12 +637,15 @@ class Controller:
                 break
         atomic_json(directory / "tests.json", tests)
         self._progress("stage", stage="evidence")
-        after = self.snapshot_for(state)
-        if after["sha256"] != before["sha256"]:
-            return self._escalate(state, "Validation changed snapshotted repository files; use tests that leave source unchanged.")
+        if permission_blocked:
+            # No test commands ran; reuse before snapshot without a redundant full-repo scan.
+            after = before
+        else:
+            after = self.snapshot_for(state)
+            if after["sha256"] != before["sha256"]:
+                return self._escalate(state, "Validation changed snapshotted repository files; use tests that leave source unchanged.")
+        # _task_diff verifies every changed file's SHA-256 while holding worktree_lock + writer lease.
         patch = self._task_diff(state, baseline, after, changed)
-        if self.snapshot_for(state)["sha256"] != after["sha256"]:
-            raise WorkflowError("Worktree changed while capturing review evidence.")
         (directory / "diff.patch").write_bytes(patch)
         atomic_json(directory / "snapshot.json", after)
         state.update(status="REVIEW", expected_sha256=after["sha256"], runner_pid=None, reason=None,

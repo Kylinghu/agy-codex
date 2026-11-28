@@ -75,7 +75,7 @@ class ProductTests(unittest.TestCase):
         self.assertIn("sole agent writer", self.f.calls()[0]["prompt"])
         self.assertIn("## Spec", self.prompts[0])
         self.assertIn("## Standards", self.prompts[0])
-        self.assertEqual(self.factories[0]["type_name"], "research")
+        self.assertEqual(self.factories[0]["type_name"], "agy-codex-reviewer")
         self.assertEqual(result["session_id"], self.c.load(result["ticket_id"])["session_id"])
         self.assertTrue(result["session_id"])
 

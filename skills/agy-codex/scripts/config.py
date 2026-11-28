@@ -7,7 +7,7 @@ def load(root):
     from runtime import WorkflowError, read_json, codex_settings
     global_path = Path(os.environ.get("AGY_CODEX_CONFIG", str(
         Path.home() / ".gemini" / "config" / "agy-codex" / "config.json"))).expanduser()
-    result = {"codex": {}, "routing": {}}
+    result = {"codex": {}, "routing": {}, "reviewer": {}}
     for path in (global_path, Path(root) / "config.json"):
         try:
             value = read_json(path)
@@ -26,4 +26,8 @@ def load(root):
             if not isinstance(value["routing"], dict):
                 raise WorkflowError("routing must be an object.")
             result["routing"].update(value["routing"])
+        if "reviewer" in value:
+            if not isinstance(value["reviewer"], dict):
+                raise WorkflowError("reviewer must be an object.")
+            result["reviewer"].update(value["reviewer"])
     return result

@@ -360,7 +360,7 @@ def _cmd_inbox(args, ws):
 def _cmd_models(args, ws):
     from routing import probe
     launcher = resolve_codex(args.codex) if args.codex else None
-    print(json.dumps(probe(ws, codex_cmd=launcher), ensure_ascii=False, indent=2))
+    print(json.dumps(probe(ws, codex_cmd=launcher, refresh=args.refresh), ensure_ascii=False, indent=2))
     return 0
 
 
@@ -432,6 +432,7 @@ def main(argv=None):
 
     models_p = commands.add_parser("models", help="Discover native Codex models and rate windows")
     _add_workspace_arg(models_p)
+    models_p.add_argument("--refresh", action="store_true", help="Bypass TTL cache and query live RPCs")
     models_p.add_argument("--codex", default=None)
     models_p.add_argument("--json", action="store_true")
 

@@ -79,11 +79,11 @@ def read_json(path):
     return json.loads(_metadata_io(lambda: path.read_text(encoding="utf-8-sig")))
 
 
-def git(repo, *args, allowed=(0,)):
+def git(repo, *args, allowed=(0,), input_bytes=None):
     env = os.environ.copy()
     env.update(GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0")
     p = subprocess.run(["git", "-c", "core.quotepath=false", "-C", str(repo), *args],
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=60)
+                       input=input_bytes, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=60)
     if p.returncode not in allowed:
         raise WorkflowError(p.stderr.decode("utf-8", "replace").strip() or f"git failed: {args[0]}")
     return p.stdout

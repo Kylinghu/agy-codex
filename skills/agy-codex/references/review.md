@@ -1,7 +1,12 @@
 # AGY read-only review contract
 
 Review the exact captured working-tree snapshot with two explicit axes, adapted
-from Matt Pocock's code-review. Use one reviewer for both axes in this workflow.
+from Matt Pocock's code-review. Use one isolated read-only reviewer for both axes.
+
+**Cognitive independence order**: inspect the original goal, acceptance criteria,
+`diff_path`, relevant changed files, and independent test results **first** and
+form your own judgment before reading `worker_report` or `last_message_path`. Do
+not inherit the Worker's conclusions or self-report as proof.
 
 ## Spec
 
