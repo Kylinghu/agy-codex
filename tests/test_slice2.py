@@ -133,6 +133,43 @@ class Slice2SlimmingTests(unittest.TestCase):
             self.assertIn("subagent: true", text)
             self.assertIn("read_file", text)
 
+    def test_user_cli_inbox_accepts_message_flag_alias(self):
+        import inbox as inbox_mod
+        import user_cli
+        ws = runtime.resolve_workspace(self.f.repo)
+        rid = "RUN-20261128-000001-abcdef"
+        inbox_dir = runtime.run_dir_for(ws, rid) / "inbox"
+        state = {
+            "schema_version": 1,
+            "run_id": rid,
+            "owner_kind": "lightweight",
+            "ticket_id": None,
+            "round": 1,
+            "cwd": str(ws.root_path),
+            "is_git": True,
+            "backend": "app-server",
+            "status": "running",
+            "inbox_window": None,
+            "inbox_dir": str(inbox_dir),
+            "artifact_dir": str(runtime.run_dir_for(ws, rid)),
+            "started_at": runtime.now(),
+            "started_ns": time.time_ns(),
+        }
+        runtime.save_run(ws, state, "started")
+        target = inbox_mod.InboxTarget(
+            inbox_dir=inbox_dir,
+            owner_id=rid,
+            load_state=lambda: runtime.load_run(ws, rid),
+            save_state=lambda s, ev=None: runtime.save_run(ws, s, ev),
+            round_number=1,
+        )
+        inbox_mod.open_window(target, state)
+        rc = user_cli.main(["inbox", "steer", "--cwd", str(ws.root_path), "--message", "Add tag", "--json"])
+        self.assertEqual(rc, 0)
+        hist = inbox_mod.history(target)
+        self.assertEqual(len(hist), 1)
+        self.assertEqual(hist[0]["text"], "Add tag")
+
 
 class Slice2ModelCatalogCacheTests(unittest.TestCase):
     def setUp(self):

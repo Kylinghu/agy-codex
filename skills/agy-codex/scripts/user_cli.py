@@ -346,13 +346,14 @@ def _resolve_inbox_target(ws, args):
 
 def _cmd_inbox(args, ws):
     target, legacy_ticket = _resolve_inbox_target(ws, args)
+    text = args.message if args.message is not None else args.text
     if args.operation == "status":
         result = inbox_mod.history(target, legacy_ticket) if legacy_ticket else inbox_mod.history(target)
     else:
         if legacy_ticket:
-            result = inbox_mod.publish(target, legacy_ticket, args.operation, args.text)
+            result = inbox_mod.publish(target, legacy_ticket, args.operation, text)
         else:
-            result = inbox_mod.publish(target, args.operation, args.text)
+            result = inbox_mod.publish(target, args.operation, text)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
@@ -426,6 +427,7 @@ def main(argv=None):
     _add_workspace_arg(inbox_p)
     inbox_p.add_argument("operation", choices=("queue", "steer", "interrupt", "status"))
     inbox_p.add_argument("text", nargs="?", default="")
+    inbox_p.add_argument("--message", "--text", dest="message", default=None, help="Optional message text flag alias")
     inbox_p.add_argument("--run", default=None)
     inbox_p.add_argument("--ticket", default=None)
     inbox_p.add_argument("--json", action="store_true")
