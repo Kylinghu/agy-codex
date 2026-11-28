@@ -1,34 +1,53 @@
 #!/usr/bin/env python3
-"""Local, serial Codex worker controller. Python standard library only."""
+"""Strict engineering Ticket controller consuming the shared Codex runtime."""
 from __future__ import annotations
 
 import argparse
-import contextlib
 import fnmatch
 import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
-import queue
 import re
 import shutil
-import signal
 import socket
-import stat
 import subprocess
 import sys
 import tempfile
 import threading
-import time
-import uuid
 
-VERSION = "0.2.0"
-# Support direct and importlib-loaded Controller entry points, including child probes.
 _scripts_dir = str(Path(__file__).resolve().parent)
 if _scripts_dir not in sys.path:
     sys.path.insert(0, _scripts_dir)
 if __name__ == "__main__":
     sys.modules.setdefault("controller", sys.modules[__name__])
+
+import runtime
+from runtime import (
+    EventSummary,
+    Interrupted,
+    VERSION,
+    WindowsJob,
+    WorkflowError,
+    Workspace,
+    _metadata_io,
+    atomic_json,
+    codex_exec_flags,
+    codex_settings,
+    configured_codex,
+    current_codex_home,
+    encode,
+    git,
+    launch_gate,
+    norm_path_key,
+    now,
+    pid_alive,
+    read_json,
+    resolve_codex,
+    stop_process,
+    worktree_lock,
+)
+
 TERMINAL = {"PASS", "ESCALATE"}
 ISSUE_FIELDS = ("kind", "detail", "evidence", "question", "recommendation")
 WORKER_SCHEMA = {
@@ -73,283 +92,6 @@ REVIEW_SCHEMA = {
 }
 
 
-class WorkflowError(RuntimeError):
-    pass
-
-
-class Interrupted(WorkflowError):
-    pass
-
-
-def now():
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-
-def encode(value):
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
-
-
-def _metadata_io(operation):
-    """Bounded retry for transient Windows sharing failures during publication.
-
-    Windows readers can briefly reject open/replace while another handle holds
-    the file. Keep the atomic rename protocol; never retry JSON parse errors,
-    missing files, unrelated I/O failures, or POSIX permission errors.
-    """
-    for delay in (0.01, 0.02, 0.04, 0.08, 0.16, None):
-        try:
-            return operation()
-        except PermissionError as exc:
-            if (sys.platform != "win32" or delay is None
-                    or getattr(exc, "winerror", None) not in (None, 5, 32, 33)):
-                raise
-            time.sleep(delay)
-
-
-def atomic_json(path, value):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, name = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-            f.write(encode(value)); f.flush(); os.fsync(f.fileno())
-        _metadata_io(lambda: os.replace(name, path))
-    finally:
-        if os.path.exists(name):
-            os.unlink(name)
-
-
-def read_json(path):
-    path = Path(path)
-    return json.loads(_metadata_io(lambda: path.read_text(encoding="utf-8-sig")))
-
-
-def git(repo, *args, allowed=(0,)):
-    env = os.environ.copy()
-    env.update(GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0")
-    p = subprocess.run(["git", "-c", "core.quotepath=false", "-C", str(repo), *args],
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=60)
-    if p.returncode not in allowed:
-        raise WorkflowError(p.stderr.decode("utf-8", "replace").strip() or f"git failed: {args[0]}")
-    return p.stdout
-
-
-def resolve_codex(executable=None):
-    """Do not pass user prompts through a Windows command shell."""
-    found = shutil.which(executable or "codex")
-    if not found:
-        raise WorkflowError("Codex CLI not found on PATH. Install/sign in on the target computer first.")
-    path = Path(found).resolve()
-    if os.name == "nt" and path.suffix.lower() in {".cmd", ".bat", ".ps1"}:
-        js = path.parent / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
-        node = shutil.which("node")
-        if js.is_file() and node:
-            return [node, str(js)]
-        raise WorkflowError("Found a Windows shell shim, but not its standard npm codex.js launcher. "
-                            "Use --codex with a native codex.exe, or repair the npm installation.")
-    return [str(path)]
-
-
-def pid_alive(pid, process_group=False):
-    if not isinstance(pid, int) or pid <= 0:
-        return False
-    if os.name == "nt":
-        import ctypes
-        from ctypes import wintypes
-        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-        kernel.OpenProcess.restype = wintypes.HANDLE
-        kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
-        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-        handle = kernel.OpenProcess(0x1000, False, pid)
-        if not handle:
-            return ctypes.get_last_error() != 87  # Unknown/access denied is treated as live.
-        try:
-            code = wintypes.DWORD()
-            return not kernel.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value == 259
-        finally:
-            kernel.CloseHandle(handle)
-    try:
-        if process_group:
-            os.killpg(pid, 0)
-        else:
-            os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-
-
-def stop_process(p):
-    """Stop an owned group, including descendants after the leader has exited."""
-    if os.name == "nt":
-        job = getattr(p, "_superagent_job", None)
-        if job:
-            job.close()
-        elif p.poll() is None:
-            subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
-    else:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(p.pid, signal.SIGTERM)
-        try:
-            p.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            pass
-        # The leader may already have exited; SIGKILL still targets surviving descendants.
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(p.pid, signal.SIGKILL)
-    p.wait(timeout=15)
-
-
-def launch_gate(argv):
-    """Wait until the Windows parent has assigned this process to its Job Object."""
-    if os.read(0, 1) != b"1":
-        return 125
-    # Unbuffered os.read above consumes only the gate byte. The real command receives
-    # the remaining stdin bytes intact and inherits the already-associated job.
-    return subprocess.call(argv)
-
-
-class WindowsJob:
-    """Keep the entire Windows worker tree owned by this controller process."""
-    def __init__(self, p):
-        import ctypes
-        from ctypes import wintypes as w
-        class Basic(ctypes.Structure):
-            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
-                        ("LimitFlags", w.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
-                        ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", w.DWORD),
-                        ("Affinity", ctypes.c_size_t), ("PriorityClass", w.DWORD), ("SchedulingClass", w.DWORD)]
-        class IO(ctypes.Structure):
-            _fields_ = [(n, ctypes.c_uint64) for n in ("ReadOperationCount", "WriteOperationCount", "OtherOperationCount", "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
-        class Extended(ctypes.Structure):
-            _fields_ = [("BasicLimitInformation", Basic), ("IoInfo", IO), ("ProcessMemoryLimit", ctypes.c_size_t),
-                        ("JobMemoryLimit", ctypes.c_size_t), ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
-        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel.CreateJobObjectW.argtypes = [ctypes.c_void_p, w.LPCWSTR]
-        kernel.CreateJobObjectW.restype = w.HANDLE
-        kernel.SetInformationJobObject.argtypes = [w.HANDLE, ctypes.c_int, ctypes.c_void_p, w.DWORD]
-        kernel.AssignProcessToJobObject.argtypes = [w.HANDLE, w.HANDLE]
-        kernel.TerminateJobObject.argtypes = [w.HANDLE, w.UINT]
-        kernel.CloseHandle.argtypes = [w.HANDLE]
-        self.kernel, self.handle = kernel, kernel.CreateJobObjectW(None, None)
-        if not self.handle:
-            raise WorkflowError("Windows could not create an owned process job.")
-        limits = Extended(); limits.BasicLimitInformation.LimitFlags = 0x2000  # KILL_ON_JOB_CLOSE
-        if not kernel.SetInformationJobObject(self.handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)) or not kernel.AssignProcessToJobObject(self.handle, w.HANDLE(int(p._handle))):
-            error = ctypes.get_last_error()
-            self.close()
-            raise WorkflowError(f"Windows process-tree containment failed (error {error}); worker stopped.")
-
-    def close(self):
-        if self.handle:
-            self.kernel.TerminateJobObject(self.handle, 1)
-            self.kernel.CloseHandle(self.handle)
-            self.handle = None
-
-
-@contextlib.contextmanager
-def worktree_lock(path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+b") as f:
-        f.seek(0, os.SEEK_END)
-        if f.tell() == 0:
-            f.write(b"0"); f.flush()
-        f.seek(0)
-        try:
-            if os.name == "nt":
-                import msvcrt
-                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            raise WorkflowError("This worktree already has a running controller; no second worker was started.") from exc
-        try:
-            yield
-        finally:
-            if os.name == "nt":
-                f.seek(0); msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                fcntl.flock(f, fcntl.LOCK_UN)
-
-
-class EventSummary:
-    def __init__(self):
-        self.data = {"session_id": None, "completed": False, "failed": False,
-                     "invalid_lines": 0, "commands": [], "changed_files": [], "errors": [], "usage": {}}
-
-    def feed(self, raw):
-        try:
-            event = json.loads(raw)
-            if not isinstance(event, dict):
-                raise ValueError("event must be an object")
-        except (ValueError, UnicodeError):
-            self.data["invalid_lines"] += 1
-            return None
-        kind = event.get("type")
-        if kind == "thread.started":
-            session = event.get("thread_id")
-            if not isinstance(session, str) or not session:
-                self.data["invalid_lines"] += 1
-            elif self.data["session_id"] and self.data["session_id"] != session:
-                self.data["failed"] = True
-                self.data["errors"].append("Multiple session IDs in one invocation")
-            else:
-                self.data["session_id"] = session
-        elif kind == "turn.completed":
-            self.data["completed"] = True
-            self.data["usage"] = event.get("usage", {})
-        elif kind in {"turn.failed", "error"}:
-            if kind == "turn.failed":
-                self.data["failed"] = True
-            self.data["errors"].append(str(event.get("error", event.get("message", event)))[:1200])
-        elif kind == "item.completed":
-            item = event.get("item", {})
-            if item.get("type") == "command_execution":
-                self.data["commands"].append({k: item.get(k) for k in ("command", "exit_code", "status")})
-            elif item.get("type") == "file_change":
-                self.data["changed_files"].extend(c.get("path", "") for c in item.get("changes", []))
-        return event
-
-
-def codex_settings(*layers):
-    """Merge explicit worker settings, without modifying Codex's own configuration."""
-    result = {}
-    for layer in layers:
-        if layer is None:
-            continue
-        if not isinstance(layer, dict) or set(layer) - {"model", "reasoning_effort", "model_provider"}:
-            raise WorkflowError("codex must contain only model, reasoning_effort and/or model_provider.")
-        for key, value in layer.items():
-            pattern = r"[A-Za-z0-9][A-Za-z0-9._:/+\-]*" if key in ("model", "model_provider") else r"[a-z][a-z0-9_\-]*"
-            if not isinstance(value, str) or not re.fullmatch(pattern, value):
-                raise WorkflowError(f"Invalid codex {key}: expected a nonempty identifier.")
-            result[key] = value
-    return result
-
-
-def configured_codex(root):
-    """Read optional plugin defaults; project metadata overrides global defaults."""
-    from config import load
-    from routing import select
-    return codex_settings(select(root), load(root)["codex"])
-
-
-def codex_exec_flags(settings):
-    settings = codex_settings(settings)
-    flags = []
-    if "model" in settings:
-        flags += ["-m", settings["model"]]
-    if "reasoning_effort" in settings:
-        flags += ["-c", "model_reasoning_effort=" + json.dumps(settings["reasoning_effort"])]
-    if "model_provider" in settings:
-        flags += ["-c", "model_provider=" + json.dumps(settings["model_provider"])]
-    return flags
-
-
 def validate_spec(spec):
     """Validate a frozen task without creating state or starting a process."""
     for field in ("title", "goal"):
@@ -385,6 +127,15 @@ class Controller:
         self.timeout = timeout
         self.cancel = threading.Event()
         self.progress_callback = None
+
+    @property
+    def workspace(self):
+        key = "git:" + hashlib.sha256(norm_path_key(self.gitdir).encode("utf-8")).hexdigest()[:16]
+        return Workspace(
+            cwd=self.repo, root_path=self.repo, git_dir=self.gitdir,
+            state_dir=self.root, lock_path=self.lock,
+            workspace_key=key, is_git=True,
+        )
 
     def _progress(self, kind, **fields):
         if self.progress_callback is not None:
@@ -447,8 +198,6 @@ class Controller:
             parent = path.parent.resolve()
             if not parent.is_relative_to(self.repo) or parent.is_relative_to(self.gitdir):
                 raise WorkflowError("Explicit task path must stay inside the worktree and outside Git metadata: " + name)
-            # A missing literal target may later become a directory prefix. Its
-            # Git-visible children are already listed; never walk ignored trees.
             if path.is_symlink() or path.is_file():
                 names.add(os.fsencode(name))
         files = {}
@@ -503,13 +252,13 @@ class Controller:
             state = {"schema_version": 2, "baseline_format": "files-v1", "id": ticket_id, "spec": spec, "status": "READY", "round": 0,
                      "snapshot_paths": snapshot_paths,
                      "max_rounds": limit, "codex_requested": worker_config, "session_id": None, "worktree": str(self.repo), "git_dir": str(self.gitdir),
-                     "codex_home": str(Path(os.environ.get("CODEX_HOME", str(Path.home()/'.codex'))).resolve()),
+                     "codex_home": current_codex_home(),
                      "base_commit": snap["head"], "expected_sha256": snap["sha256"], "created_at": now(),
                      "host": socket.gethostname(), "runner_pid": None, "child_pid": None, "last_review": None,
                      "reason": None, "resolutions": [], "resolution_allowed": False}
             directory.mkdir(parents=True)
             try:
-                self._capture_files(snap, directory/"baseline-files", [n for n in snap["files"] if self._in_scope(n, scope)])
+                self._capture_files(snap, directory / "baseline-files", [n for n in snap["files"] if self._in_scope(n, scope)])
                 if self.snapshot(snapshot_paths)["sha256"] != snap["sha256"]:
                     raise WorkflowError("Worktree changed while capturing the task baseline; retry after the other writer finishes.")
                 atomic_json(directory / "baseline.json", snap)
@@ -526,7 +275,7 @@ class Controller:
 
     def _contract_path(self, state):
         directory = self.ticket_dir(state["id"])
-        return directory / ("contract.json" if (directory/"contract.json").exists() else "ticket.json")
+        return directory / ("contract.json" if (directory / "contract.json").exists() else "ticket.json")
 
     def _prompt(self, state):
         header = (f"Ticket {state['id']}; implementation {state['round']}/{state['max_rounds']}.\n"
@@ -552,80 +301,50 @@ class Controller:
                 "include observed evidence for a real blocker. The Router handles user communication.\n")
 
     def _process(self, state, argv, prompt, stdout_path, stderr_path, on_line=None, timeout=None):
-        if self.cancel.is_set():
-            raise Interrupted("Execution was canceled before process startup; use recover to continue.")
-        env = os.environ.copy()
-        env["PYTHONDONTWRITEBYTECODE"] = "1"
-        opts = {"start_new_session": True} if os.name != "nt" else {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-        q = queue.Queue()
-        with Path(stdout_path).open("wb") as out, Path(stderr_path).open("wb") as err:
-            gated = os.name == "nt"
-            launch_argv = [sys.executable, "-B", str(Path(__file__).resolve()), "_child-gate", json.dumps(argv)] if gated else argv
-            p = subprocess.Popen(launch_argv, cwd=self.repo, env=env, stdin=subprocess.PIPE if prompt is not None or gated else subprocess.DEVNULL,
-                                 stdout=subprocess.PIPE, stderr=err, **opts)
-            state["child_pid"] = p.pid
-            t = None
-            writer = None
-            try:
-                if os.name == "nt":
-                    p._superagent_job = WindowsJob(p)
+        def on_pid(pid, started):
+            if started:
+                state["child_pid"] = pid
                 self.save(state, "process_started")
-                def reader():
-                    try:
-                        for line in iter(p.stdout.readline, b""):
-                            q.put(line)
-                    finally:
-                        q.put(None)
-                t = threading.Thread(target=reader, daemon=True); t.start()
-                if prompt is not None or gated:
-                    def send_input():
-                        try:
-                            p.stdin.write((b"1" if gated else b"") + (prompt or "").encode("utf-8")); p.stdin.close()
-                        except (BrokenPipeError, OSError, ValueError):
-                            pass
-                    writer = threading.Thread(target=send_input, daemon=True); writer.start()
-                deadline = time.monotonic() + (timeout or self.timeout)
-                stream_done = False
-                group_stopped = False
-                while not stream_done or p.poll() is None:
-                    if self.cancel.is_set():
-                        raise Interrupted("Worker was canceled; use recover to resume its saved Session.")
-                    if time.monotonic() > deadline:
-                        raise Interrupted("Process timeout; the owned process tree was stopped. Use recover to continue.")
-                    if p.poll() is not None and not group_stopped:
-                        stop_process(p)
-                        group_stopped = True
-                    try:
-                        line = q.get(timeout=0.15)
-                    except queue.Empty:
-                        continue
-                    if line is None:
-                        stream_done = True
-                    else:
-                        out.write(line); out.flush()
-                        if on_line:
-                            on_line(line)
-                result = p.wait()
-                return result
-            finally:
-                stop_process(p)
-                if t:
-                    t.join(timeout=2)
-                if writer:
-                    writer.join(timeout=2)
-                p.stdout.close()
-                if p.stdin and not p.stdin.closed:
-                    p.stdin.close()
-                # Keep the last owned PID as recovery evidence, not as a claim it is still live.
-                state["last_child_pid"] = p.pid
+            else:
+                state["last_child_pid"] = pid
                 state["child_pid"] = None
                 self.save(state)
+
+        return runtime.run_process(
+            self.repo, argv, prompt, stdout_path, stderr_path,
+            on_line=on_line, on_pid=on_pid,
+            timeout=timeout or self.timeout, cancel=self.cancel,
+        )
 
     def _escalate(self, state, reason, recoverable=False):
         state.update(status="ESCALATE", reason=reason, runner_pid=None,
                      recoverable_interruption=recoverable, resolution_allowed=False, stop_origin="controller")
         self.save(state, "escalated")
         return state
+
+    def _sync_from_run(self, state, run_state, event=None):
+        """Project single-source Run execution facts onto the owning Ticket record."""
+        state["run_id"] = run_state["run_id"]
+        if run_state.get("thread_id"):
+            state["session_id"] = run_state["thread_id"]
+        if run_state.get("backend"):
+            state["backend"] = run_state["backend"]
+        if run_state.get("model_provider"):
+            state["model_provider"] = run_state["model_provider"]
+        if "backend_model" in run_state:
+            state["backend_model"] = run_state.get("backend_model")
+        if "backend_effort" in run_state:
+            state["backend_effort"] = run_state.get("backend_effort")
+        state["app_server_pending"] = bool(run_state.get("turn_pending"))
+        state["active_turn_id"] = run_state.get("active_turn_id")
+        state["last_turn_id"] = run_state.get("last_turn_id")
+        state["last_turn_status"] = run_state.get("last_turn_status")
+        state["inbox_window"] = run_state.get("inbox_window")
+        state["queue_turns"] = run_state.get("queue_turns", state.get("queue_turns", 0))
+        state["child_pid"] = run_state.get("child_pid")
+        if run_state.get("last_child_pid") is not None:
+            state["last_child_pid"] = run_state.get("last_child_pid")
+        self.save(state, event)
 
     def run(self, ticket_id, *, codex=None):
         with worktree_lock(self.lock):
@@ -635,8 +354,7 @@ class Controller:
                 raise WorkflowError(f"Cannot run from {state['status']}; use status, review, or recover.")
             if state["round"] >= state["max_rounds"]:
                 return self._escalate(state, "Implementation round limit reached; no fourth worker call.")
-            current_home = str(Path(os.environ.get("CODEX_HOME", str(Path.home()/'.codex'))).resolve())
-            if state["host"] != socket.gethostname() or state["codex_home"] != current_home:
+            if state["host"] != socket.gethostname() or state["codex_home"] != current_codex_home():
                 return self._escalate(state, "Host or CODEX_HOME changed; session provenance must be reconciled.")
             if self.snapshot_for(state)["sha256"] != state["expected_sha256"]:
                 return self._escalate(state, "Worktree changed outside this Ticket since the last recorded snapshot.")
@@ -657,74 +375,102 @@ class Controller:
                 requested["model_provider"] = prior_provider
             if requested.get("model_provider") or (backend == "exec" and policy(self.root)["allowed_providers"]):
                 verify_provider(self.root, requested.get("model_provider"))
-            state.update(codex_requested=requested, status="RUNNING", round=state["round"]+1, runner_pid=os.getpid(), reason=None,
+            state.update(codex_requested=requested, status="RUNNING", round=state["round"] + 1, runner_pid=os.getpid(), reason=None,
                          recoverable_interruption=False, resolution_allowed=False, stop_origin=None)
             directory = self._round_dir(state)
             if directory.exists() and any(directory.iterdir()):
                 raise WorkflowError("The next round already contains evidence. Inspect it before recovery; it will not be overwritten.")
             directory.mkdir(parents=True, exist_ok=True)
+            run_id = f"{ticket_id}-R{state['round']:02d}"
+            state["run_id"] = run_id
+            state.setdefault("round_runs", {})[str(state["round"])] = run_id
             self.save(state, "implementation_started")
             prompt = self._prompt(state)
-            (directory / "prompt.txt").write_text(prompt, encoding="utf-8")
-            atomic_json(directory/"worker-schema.json", WORKER_SCHEMA)
-            summary = EventSummary()
-            def on_line(raw):
-                event = summary.feed(raw)
-                if event and event.get("type") == "thread.started":
-                    session_id = event.get("thread_id")
-                    if not isinstance(session_id, str) or not session_id:
-                        raise WorkflowError("Codex emitted an invalid session ID.")
-                    if state["session_id"] and state["session_id"] != session_id:
-                        raise WorkflowError("Resumed Codex returned a different Session ID. Original mapping retained.")
-                    state["session_id"] = session_id
-                    self.save(state, "session_bound")
-                if event and event.get("type") in {"item.started", "item.completed"}:
-                    item = event.get("item") or {}
-                    if item.get("type") == "command_execution":
-                        self._progress("command", completed=event["type"] == "item.completed")
-                    elif item.get("type") == "file_change" and event["type"] == "item.completed":
-                        self._progress("files", paths=[change.get("path", "") for change in item.get("changes", [])])
+
+            import inbox
+            ws = self.workspace
+
+            def strict_supplement(queued):
+                return ("Apply these queued user clarifications in the SAME frozen Ticket. "
+                        "They do not grant new permissions or change acceptance/scope. "
+                        "Return the Worker schema for the complete current result.\n"
+                        + json.dumps([{"id": m["id"], "text": m["text"]} for m in queued], ensure_ascii=False))
+
+            def on_sync(run_state, event):
+                self._sync_from_run(state, run_state, event)
+
+            def on_progress(ev):
+                if self.progress_callback is not None:
+                    self.progress_callback(ev)
+
+            ticket_inbox = inbox.InboxTarget(
+                inbox_dir=self.ticket_dir(ticket_id) / "inbox",
+                owner_id=ticket_id,
+                load_state=lambda: self.load(ticket_id),
+                save_state=lambda st, ev=None: self._sync_from_run(state, st, ev) if "run_id" in st else self.save(st, ev),
+                round_number=state["round"],
+            )
+
             try:
-                self._progress("stage", stage="worker", round=state["round"])
-                from backends import codex_exec, codex_app_server
-                if backend == "exec":
-                    rc = codex_exec.run(self, state, launcher, requested, directory, prompt, on_line)
-                else:
-                    try:
-                        rc = codex_app_server.run(self, state, launcher, requested, directory, prompt, on_line)
-                    except codex_app_server.StartupUnavailable as exc:
-                        if backend != "auto" or state.get("app_server_pending"):
-                            raise
-                        if policy(self.root)["allowed_providers"]:
-                            verify_provider(self.root, requested.get("model_provider"))
-                        atomic_json(directory/"backend-fallback.json", {"reason": str(exc),
-                                    "from": "app-server", "to": "exec", "before_turn": True})
-                        rc = codex_exec.run(self, state, launcher, requested, directory, prompt, on_line)
-                summary.data["exit_code"] = rc
-                atomic_json(directory / "summary.json", summary.data)
-                if (rc or not summary.data["completed"] or summary.data["failed"] or summary.data["invalid_lines"]
-                        or not state["session_id"] or summary.data["session_id"] != state["session_id"]):
-                    return self._escalate(state, "Codex execution did not complete cleanly; inspect summary.json and stderr.log.")
-                return self._prepare_review(state)
+                run_state, summary_data = runtime.execute_run(
+                    ws, prompt,
+                    run_id=run_id,
+                    artifact_dir=directory,
+                    inbox_dir=self.ticket_dir(ticket_id) / "inbox",
+                    inbox_target=ticket_inbox,
+                    session_id=state["session_id"],
+                    prior_provider=prior_provider,
+                    codex=requested,
+                    backend_override=backend,
+                    sandbox="workspace-write",
+                    output_schema=WORKER_SCHEMA,
+                    codex_cmd=launcher,
+                    timeout=self.timeout,
+                    cancel=self.cancel,
+                    on_progress=on_progress,
+                    on_state_sync=on_sync,
+                    owner_kind="strict",
+                    ticket_id=ticket_id,
+                    round_number=state["round"],
+                    allow_strict=True,
+                    already_locked=True,
+                    update_latest=False,
+                    supplement_prompt_builder=strict_supplement,
+                    queue_turns=state.get("queue_turns", 0),
+                )
+                if run_state["status"] == "completed":
+                    return self._prepare_review(state)
+                completed_worker = (
+                    summary_data.get("exit_code") == 0 and summary_data.get("completed")
+                    and not summary_data.get("failed") and not summary_data.get("invalid_lines")
+                    and summary_data.get("session_id") == state["session_id"]
+                )
+                recoverable = bool(state["session_id"]) and (
+                    run_state["status"] in {"interrupted", "unknown"}
+                    or completed_worker
+                    or bool(state.get("app_server_pending"))
+                )
+                return self._escalate(
+                    state,
+                    run_state.get("error") or "Codex execution did not complete cleanly; inspect summary.json and stderr.log.",
+                    recoverable=recoverable,
+                )
             except (Exception, KeyboardInterrupt) as exc:
-                # A native Turn can complete and persist its successful summary just
-                # before a pause or cleanup error. Preserve that round for recovery.
-                saved_summary = directory/"summary.json"
-                if (state.get("backend") == "app-server" and not state.get("app_server_pending")
-                        and state.get("last_turn_status") == "completed" and summary.data["completed"]
-                        and not summary.data["failed"] and not summary.data["invalid_lines"]
-                        and summary.data["session_id"] == state["session_id"] and saved_summary.exists()):
-                    done = read_json(saved_summary)
-                    if (done.get("exit_code") == 0 and done.get("completed") and not done.get("failed")
-                            and not done.get("invalid_lines") and done.get("session_id") == state["session_id"]):
-                        summary.data["exit_code"] = 0
-                summary.data["controller_error"] = str(exc) or type(exc).__name__
-                atomic_json(saved_summary, summary.data)
-                completed_worker = (summary.data.get("exit_code") == 0 and summary.data["completed"]
-                                    and not summary.data["failed"] and not summary.data["invalid_lines"]
-                                    and summary.data["session_id"] == state["session_id"])
-                recoverable = bool(state["session_id"]) and (isinstance(exc, (Interrupted, KeyboardInterrupt)) or completed_worker or state.get("app_server_pending"))
-                return self._escalate(state, summary.data["controller_error"], recoverable=recoverable)
+                saved_summary = directory / "summary.json"
+                summary_data = read_json(saved_summary) if saved_summary.exists() else {}
+                summary_data["controller_error"] = str(exc) or type(exc).__name__
+                atomic_json(saved_summary, summary_data)
+                completed_worker = (
+                    summary_data.get("exit_code") == 0 and summary_data.get("completed")
+                    and not summary_data.get("failed") and not summary_data.get("invalid_lines")
+                    and summary_data.get("session_id") == state["session_id"]
+                )
+                recoverable = bool(state["session_id"]) and (
+                    isinstance(exc, (Interrupted, KeyboardInterrupt))
+                    or completed_worker
+                    or bool(state.get("app_server_pending"))
+                )
+                return self._escalate(state, summary_data["controller_error"], recoverable=recoverable)
 
     def _changed(self, snapshot, baseline):
         return sorted(n for n in set(snapshot["files"]) | set(baseline["files"])
@@ -764,7 +510,7 @@ class Controller:
             info = snapshot["files"].get(name, {"kind": "missing"})
             if info.get("kind") == "missing":
                 continue
-            source, target = self.repo/name, destination/name
+            source, target = self.repo / name, destination / name
             target.parent.mkdir(parents=True, exist_ok=True)
             if info.get("kind") == "symlink":
                 if not source.is_symlink() or os.readlink(source) != info["target"]:
@@ -781,22 +527,21 @@ class Controller:
     def _task_diff(self, state, baseline, snapshot, changed):
         directory = self._round_dir(state)
         if state.get("baseline_format") != "files-v1":
-            # v0.1/v0.2 tickets were required to start from a clean HEAD.
             patch = git(self.repo, "diff", "--no-ext-diff", "--no-textconv", "--binary", "--full-index", state["base_commit"], "--")
             for name in git(self.repo, "ls-files", "--others", "--exclude-standard", "-z").split(b"\0"):
                 if name:
                     patch += git(self.repo, "diff", "--no-ext-diff", "--no-textconv", "--binary", "--no-index", "--", os.devnull, os.fsdecode(name), allowed=(0, 1))
             return patch
-        before_dir = self.ticket_dir(state["id"])/"baseline-files"
-        after_dir = directory/"changed-files"
+        before_dir = self.ticket_dir(state["id"]) / "baseline-files"
+        after_dir = directory / "changed-files"
         self._capture_files(snapshot, after_dir, changed)
         patch = b""
         metadata = []
         for name in changed:
             old = baseline["files"].get(name, {"kind": "missing"})
             new = snapshot["files"].get(name, {"kind": "missing"})
-            old_path = before_dir/name if old.get("kind") != "missing" else Path(os.devnull)
-            new_path = after_dir/name if new.get("kind") != "missing" else Path(os.devnull)
+            old_path = before_dir / name if old.get("kind") != "missing" else Path(os.devnull)
+            new_path = after_dir / name if new.get("kind") != "missing" else Path(os.devnull)
             if old.get("sha256") and hashlib.sha256(old_path.read_bytes()).hexdigest() != old["sha256"]:
                 raise WorkflowError("Saved baseline content changed: " + name)
             if old.get("kind") == "symlink" and old_path.read_bytes() != os.fsencode(old["target"]):
@@ -804,13 +549,13 @@ class Controller:
             metadata.append({"path": name, "before": old, "after": new})
             patch += ("\n# TASK PATH " + json.dumps(name, ensure_ascii=False) + "\n").encode("utf-8")
             patch += git(self.repo, "diff", "--no-ext-diff", "--no-textconv", "--binary", "--full-index", "--no-index", "--", str(old_path), str(new_path), allowed=(0, 1))
-        atomic_json(directory/"diff-metadata.json", {"basis": "task-start", "files": metadata,
+        atomic_json(directory / "diff-metadata.json", {"basis": "task-start", "files": metadata,
                     "note": "Git content diff against captured task-start bytes. Symlinks use target text; exact file kinds/modes are recorded here. Review evidence, not an apply-ready patch."})
         return patch
 
     def _worker_report(self, directory):
         try:
-            value = read_json(directory/"last-message.md")
+            value = read_json(directory / "last-message.md")
             if (not isinstance(value, dict) or not isinstance(value.get("outcome"), str)
                     or value["outcome"] not in {"done", "decision_required", "blocked"}):
                 raise ValueError("Missing valid outcome")
@@ -830,7 +575,6 @@ class Controller:
                 raise ValueError("Missing concrete issue and evidence")
             return value
         except (OSError, ValueError) as exc:
-            # A malformed report is a reviewable defect, not proof of completion.
             return {"outcome": "invalid_report", "summary": str(exc), "changes": [], "checks": [], "issue": None}
 
     def _prepare_review(self, state):
@@ -838,7 +582,7 @@ class Controller:
         before = self.snapshot_for(state)
         if before["head"] != state["base_commit"]:
             return self._escalate(state, "HEAD changed during the Ticket; no automatic Git repair was attempted.")
-        baseline = read_json(self.ticket_dir(state["id"])/"baseline.json")
+        baseline = read_json(self.ticket_dir(state["id"]) / "baseline.json")
         if before["index_sha256"] != baseline["index_sha256"]:
             return self._escalate(state, "Git index changed during the Ticket; existing staged work was left untouched.")
         changed = self._changed(before, baseline)
@@ -847,9 +591,9 @@ class Controller:
             outside = [name for name in changed if not self._in_scope(name, scope)]
             if outside:
                 return self._escalate(state, "Changes outside Ticket scope: " + ", ".join(outside))
-        worker_report = self._worker_report(directory) if (directory/"worker-schema.json").exists() else None
+        worker_report = self._worker_report(directory) if (directory / "worker-schema.json").exists() else None
         if worker_report:
-            atomic_json(directory/"worker-report.json", worker_report)
+            atomic_json(directory / "worker-report.json", worker_report)
         permission_blocked = bool(worker_report and (worker_report.get("issue") or {}).get("kind") == "permission")
         tests = []
         self._progress("stage", stage="validation", round=state["round"], test_total=len(state["spec"]["test_commands"]))
@@ -873,7 +617,7 @@ class Controller:
                 tests.append({"argv": argv, "exit_code": None, "error": str(exc), "stdout": str(output), "stderr": str(error)})
                 self._progress("test", index=i, result="FAIL")
                 break
-        atomic_json(directory/"tests.json", tests)
+        atomic_json(directory / "tests.json", tests)
         self._progress("stage", stage="evidence")
         after = self.snapshot_for(state)
         if after["sha256"] != before["sha256"]:
@@ -881,8 +625,8 @@ class Controller:
         patch = self._task_diff(state, baseline, after, changed)
         if self.snapshot_for(state)["sha256"] != after["sha256"]:
             raise WorkflowError("Worktree changed while capturing review evidence.")
-        (directory/"diff.patch").write_bytes(patch)
-        atomic_json(directory/"snapshot.json", after)
+        (directory / "diff.patch").write_bytes(patch)
+        atomic_json(directory / "snapshot.json", after)
         state.update(status="REVIEW", expected_sha256=after["sha256"], runner_pid=None, reason=None,
                      recoverable_interruption=False)
         from inbox import review_messages
@@ -890,13 +634,13 @@ class Controller:
                   "worktree": str(self.repo), "base_commit": state["base_commit"], "spec": state["spec"],
                   "session_id": state["session_id"], "changed_files": changed, "tests": tests,
                   "all_tests_passed": len(tests) == len(state["spec"]["test_commands"]) and all(x["exit_code"] == 0 for x in tests),
-                  "diff_path": str(directory/"diff.patch"), "summary_path": str(directory/"summary.json"),
+                  "diff_path": str(directory / "diff.patch"), "summary_path": str(directory / "summary.json"),
                   "diff_basis": "task-start" if state.get("baseline_format") else "HEAD",
-                  "diff_metadata_path": str(directory/"diff-metadata.json") if state.get("baseline_format") else None,
+                  "diff_metadata_path": str(directory / "diff-metadata.json") if state.get("baseline_format") else None,
                   "worker_report": worker_report, "resolutions": state.get("resolutions", []),
                   "inbox_messages": review_messages(self, state["id"]),
-                  "last_message_path": str(directory/"last-message.md"), "previous_review": state.get("last_review")}
-        atomic_json(directory/"review-packet.json", packet)
+                  "last_message_path": str(directory / "last-message.md"), "previous_review": state.get("last_review")}
+        atomic_json(directory / "review-packet.json", packet)
         self.save(state, "review_ready")
         return state
 
@@ -906,7 +650,7 @@ class Controller:
             raise WorkflowError("No pending review for this Ticket.")
         if self.snapshot_for(state)["sha256"] != state["expected_sha256"]:
             raise WorkflowError("Review snapshot is stale. Inspect the external change, then refresh the review packet.")
-        return read_json(self._round_dir(state)/"review-packet.json")
+        return read_json(self._round_dir(state) / "review-packet.json")
 
     def refresh(self, ticket_id):
         with worktree_lock(self.lock):
@@ -959,7 +703,7 @@ class Controller:
                 record["worker_permission_evidence"] = worker["issue"]["evidence"]
             effective = "ESCALATE" if decision == "REVISE" and state["round"] >= state["max_rounds"] else decision
             record["effective_verdict"] = effective
-            atomic_json(self._round_dir(state)/"review.json", record)
+            atomic_json(self._round_dir(state) / "review.json", record)
             state.update(status=effective, last_review=record, reason="Round limit reached" if effective != decision else review["summary"],
                          stop_origin="review",
                          resolution_allowed=bool(effective == "ESCALATE" and decision == "ESCALATE" and blocker
@@ -1017,14 +761,59 @@ class Controller:
                 raise WorkflowError("The saved worker/process group is still alive. No replacement was started.")
             if state.get("runner_pid") != os.getpid() and pid_alive(state.get("runner_pid")):
                 raise WorkflowError("The saved controller process is still alive. No replacement was started.")
-            if state.get("app_server_pending"):
-                from backends.codex_app_server import reconcile
-                reconcile(self, state)
+
+            import inbox
+            ws = self.workspace
+            run_id = state.get("run_id")
+            if run_id and (runtime.run_dir_for(ws, run_id) / "run.json").is_file():
+                ticket_inbox = inbox.InboxTarget(
+                    inbox_dir=self.ticket_dir(ticket_id) / "inbox",
+                    owner_id=ticket_id,
+                    load_state=lambda: self.load(ticket_id),
+                    save_state=lambda st, ev=None: self._sync_from_run(state, st, ev) if "run_id" in st else self.save(st, ev),
+                    round_number=state["round"],
+                )
+                runtime.reconcile_run(
+                    ws, run_id, codex_cmd=self.codex_cmd, timeout=30,
+                    cancel=self.cancel,
+                    on_state_sync=lambda rs, ev=None: self._sync_from_run(state, rs, ev),
+                    inbox_target=ticket_inbox,
+                )
+            elif state.get("app_server_pending"):
+                # Legacy v0.2 Ticket saved without a Run record.
+                from backends.codex_app_server import reconcile_run as legacy_reconcile
+                legacy_state = {
+                    "thread_id": state.get("session_id"),
+                    "active_turn_id": state.get("active_turn_id"),
+                    "turn_pending": True,
+                    "model_provider": state.get("model_provider"),
+                    "sandbox": "workspace-write",
+                }
+                def legacy_save(ev=None):
+                    state.update(
+                        app_server_pending=legacy_state["turn_pending"],
+                        last_turn_id=legacy_state.get("last_turn_id"),
+                        last_turn_status=legacy_state.get("last_turn_status"),
+                        active_turn_id=legacy_state.get("active_turn_id"),
+                    )
+                    self.save(state, ev)
+                ticket_inbox = inbox.InboxTarget(
+                    inbox_dir=self.ticket_dir(ticket_id) / "inbox",
+                    owner_id=ticket_id,
+                    load_state=lambda: self.load(ticket_id),
+                    save_state=lambda st, ev=None: self.save(st, ev),
+                    round_number=state["round"],
+                )
+                legacy_reconcile(
+                    ws=ws, state=legacy_state, save_fn=legacy_save,
+                    artifact_dir=self._round_dir(state), inbox_target=ticket_inbox,
+                    codex_cmd=self.codex_cmd, timeout=30, cancel=self.cancel,
+                )
             if state.get("inbox_window"):
-                from inbox import recover_window
-                recover_window(self, state)
+                inbox.recover_window(self, state)
+
             summary = EventSummary()
-            log = self._round_dir(state)/"codex.jsonl"
+            log = self._round_dir(state) / "codex.jsonl"
             if log.exists():
                 for line in log.read_bytes().splitlines():
                     summary.feed(line)
@@ -1032,13 +821,11 @@ class Controller:
             if recovered_id and state["session_id"] and recovered_id != state["session_id"]:
                 return self._escalate(state, "Recovered JSONL disagrees with saved Session ID.")
             state["session_id"] = state["session_id"] or recovered_id
-            saved_summary = self._round_dir(state)/"summary.json"
+            saved_summary = self._round_dir(state) / "summary.json"
             if saved_summary.exists() and state["session_id"]:
                 done = read_json(saved_summary)
                 if (done.get("exit_code") == 0 and done.get("completed") and not done.get("failed")
                         and not done.get("invalid_lines") and done.get("session_id") == state["session_id"]):
-                    # The implementation finished; only validation/publication of its review packet
-                    # was interrupted. Re-run validation in the same round, without another worker.
                     state.update(child_pid=None, runner_pid=os.getpid(), recoverable_interruption=True)
                     self.save(state, "completed_worker_recovered")
                     try:
@@ -1067,7 +854,7 @@ class Controller:
             return self._escalate(state, reason)
 
 
-def doctor(repo, codex_cmd=None):
+def doctor(repo, codex_cmd=None, *, require_git=True, check_windows_sandbox=False):
     report = {"controller_version": VERSION, "python": sys.version.split()[0], "platform": sys.platform,
               "python_executable": sys.executable, "git_executable": shutil.which("git"),
               "agy_cli_on_path": shutil.which("agy") or shutil.which("antigravity"),
@@ -1086,6 +873,7 @@ def doctor(repo, codex_cmd=None):
             report["git_error"] = str(exc)
     else:
         report["git_error"] = "Git was not found on PATH. Use an installed Git executable in this environment."
+    launcher = None
     try:
         launcher = codex_cmd or resolve_codex()
         report["codex_launcher"] = launcher
@@ -1099,7 +887,7 @@ def doctor(repo, codex_cmd=None):
             report["checks"][name] = p.returncode == 0 and (all(flag in text for flag in ("--json", "--output-last-message", "--output-schema")) if name.endswith("help") else True)
     except (OSError, subprocess.SubprocessError, WorkflowError) as exc:
         report["codex_error"] = str(exc); report["checks"]["codex"] = False
-    task_home = Path(os.environ.get("CODEX_HOME", str(Path.home()/'.codex'))).resolve()
+    task_home = Path(current_codex_home())
     report["codex_home"] = str(task_home)
     for label, path in (("workspace_write", Path(repo).resolve()), ("codex_home_write", task_home)):
         try:
@@ -1108,7 +896,7 @@ def doctor(repo, codex_cmd=None):
             report["checks"][label] = True
         except OSError as exc:
             report["checks"][label] = False
-            report[label+"_error"] = str(exc)
+            report[label + "_error"] = str(exc)
     if report["checks"]["git_invocation"]:
         try:
             controller = Controller(repo)
@@ -1116,13 +904,24 @@ def doctor(repo, codex_cmd=None):
             report["state_directory"] = str(controller.root)
             report["checks"]["git_repository"] = True
             report["clean_worktree"] = not bool(git(controller.repo, "status", "--porcelain=v1", "--untracked-files=all").strip())
-            report["existing_context"] = {x: (controller.repo/x).exists() for x in ("AGENTS.md", "PLAN.md", "RESUME.md", ".agents/skills")}
+            report["existing_context"] = {x: (controller.repo / x).exists() for x in ("AGENTS.md", "PLAN.md", "RESUME.md", ".agents/skills")}
         except (OSError, subprocess.SubprocessError, WorkflowError) as exc:
             report["checks"]["git_repository"] = False; report["git_error"] = str(exc)
     else:
         report["checks"]["git_repository"] = False
         report["git_repository_error"] = "Not checked because Git is unavailable; see git_error."
-    report["static_checks_passed"] = all(report["checks"].values())
+    if not report["checks"]["git_repository"] and not require_git:
+        ws = runtime.resolve_workspace(repo)
+        report["workspace"] = str(ws.root_path)
+        report["state_directory"] = str(ws.state_dir)
+    if check_windows_sandbox and launcher and os.name == "nt":
+        from backends.codex_app_server import probe_windows_sandbox_readiness
+        report["windows_sandbox_readiness"] = probe_windows_sandbox_readiness(Path(repo).resolve(), launcher)
+    if require_git:
+        report["static_checks_passed"] = all(report["checks"].values())
+    else:
+        required = {k: v for k, v in report["checks"].items() if not k.startswith("git_")}
+        report["static_checks_passed"] = all(required.values())
     return report
 
 

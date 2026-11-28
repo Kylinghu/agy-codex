@@ -3,7 +3,7 @@ from config import load
 
 
 def policy(root):
-    from controller import WorkflowError, codex_settings
+    from runtime import WorkflowError, codex_settings
     value = load(root)["routing"]
     if set(value) - {"strategy", "tiers", "default_tier", "allow_upgrade", "allowed_providers"}:
         raise WorkflowError("Unknown routing configuration field.")
@@ -34,7 +34,7 @@ def policy(root):
 
 
 def select(root, tier=None):
-    from controller import WorkflowError
+    from runtime import WorkflowError
     p = policy(root)
     if tier is None:
         if p["strategy"] == "manual" or p["default_tier"] is None:
@@ -46,14 +46,14 @@ def select(root, tier=None):
 
 
 def verify_provider(root, provider):
-    from controller import WorkflowError
+    from runtime import WorkflowError
     allowed = policy(root)["allowed_providers"]
     if allowed and provider not in allowed:
         raise WorkflowError("Codex provider is outside the configured allowlist.")
 
 
 def validate_catalog(requested, models):
-    from controller import WorkflowError
+    from runtime import WorkflowError
     model = requested.get("model")
     if not model:
         return
@@ -67,10 +67,10 @@ def validate_catalog(requested, models):
         raise WorkflowError(f"Requested effort {effort} is not in the model catalog.")
 
 
-def discover(rpc, provider=None, *, include_rates=True):
-    from controller import WorkflowError
+def discover(rpc, state_dir, cwd, provider=None, *, include_rates=True):
+    from runtime import WorkflowError
     from backends.codex_app_server import RpcError
-    config = rpc.call("config/read", {"cwd": str(rpc.c.repo), "includeLayers": False}, timeout=20).get("config", {})
+    config = rpc.call("config/read", {"cwd": str(cwd), "includeLayers": False}, timeout=20).get("config", {})
     provider_response = rpc.call("modelProvider/list", {}, timeout=20)
     provider = provider or config.get("model_provider") or provider_response.get("defaultProviderId")
     providers = provider_response.get("data", [])
@@ -90,11 +90,11 @@ def discover(rpc, provider=None, *, include_rates=True):
         seen.add(cursor)
     rates = None
     if include_rates:
-        from controller import Interrupted
+        from runtime import Interrupted
         try:
             rates = rpc.call("account/rateLimits/read", {}, timeout=10)
         except (RpcError, Interrupted):
-            if rpc.c.cancel.is_set():
+            if rpc.cancel.is_set():
                 raise
     # Only expose noncredential fields, never native config layers or provider URLs.
     return {"default_model": config.get("model"), "default_provider": provider,
@@ -107,14 +107,19 @@ def discover(rpc, provider=None, *, include_rates=True):
                 "ordinaryUsageAllowed": rates.get("ordinaryUsageAllowed"),
                 "rateLimits": {k: (rates.get("rateLimits") or {}).get(k)
                                for k in ("primary", "secondary", "planType")}},
-            "catalog_is_not_entitlement": True, "routing": policy(rpc.c.root)}
+            "catalog_is_not_entitlement": True, "routing": policy(state_dir)}
 
 
-def probe(c):
+def probe(target, *, codex_cmd=None):
+    """Discover models and rate limits for either a Workspace or a Strict Controller."""
     import tempfile
-    from controller import resolve_codex
+    from runtime import Workspace, resolve_codex
     from backends.codex_app_server import Client
+    if isinstance(target, Workspace):
+        cwd, state_dir, launcher = target.root_path, target.state_dir, codex_cmd or resolve_codex()
+    else:
+        cwd, state_dir, launcher = target.repo, target.root, codex_cmd or target.codex_cmd or resolve_codex()
     with tempfile.TemporaryDirectory(prefix="agy-model-catalog-") as directory:
-        requested = load(c.root)["codex"]
-        with Client(c, c.codex_cmd or resolve_codex(), directory, requested=requested, timeout=60) as rpc:
-            return discover(rpc, requested.get("model_provider"))
+        requested = load(state_dir)["codex"]
+        with Client(cwd, launcher, directory, requested=requested, timeout=60) as rpc:
+            return discover(rpc, state_dir, cwd, requested.get("model_provider"))

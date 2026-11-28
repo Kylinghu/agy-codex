@@ -1,9 +1,11 @@
 """Owned stdio JSON-RPC transport for Codex App Server v2.
 
-The Controller owns Tickets, verification and the worktree lock. No request
-after turn submission is automatically replayed in another backend.
+Decoupled from Strict Controller/Ticket/WORKER_SCHEMA. Shared by lightweight runs
+and Strict rounds. No request after turn submission is automatically replayed
+in another backend.
 """
 from __future__ import annotations
+
 import json
 import os
 from pathlib import Path
@@ -13,8 +15,16 @@ import sys
 import threading
 import time
 
-from controller import (Interrupted, WorkflowError, WindowsJob, WORKER_SCHEMA,
-                        atomic_json, now, resolve_codex, stop_process)
+import runtime
+from runtime import (
+    Interrupted,
+    WindowsJob,
+    WorkflowError,
+    atomic_json,
+    now,
+    resolve_codex,
+    stop_process,
+)
 
 
 class StartupUnavailable(WorkflowError):
@@ -29,14 +39,17 @@ class RpcError(WorkflowError):
 
 
 class Client:
-    def __init__(self, c, launcher, directory, state=None, requested=None, timeout=None):
-        self.c, self.state = c, state
+    def __init__(self, cwd, launcher, directory, *, requested=None, timeout=900,
+                 cancel=None, on_pid=None):
+        self.cwd = Path(cwd)
         self.directory = Path(directory)
         self.argv = [*launcher, "app-server", "--listen", "stdio://"]
         provider = (requested or {}).get("model_provider")
         if provider:
             self.argv += ["-c", "model_provider=" + json.dumps(provider)]
-        self.deadline = time.monotonic() + (timeout or c.timeout)
+        self.deadline = time.monotonic() + (timeout or 900)
+        self.cancel = cancel or threading.Event()
+        self.on_pid = on_pid
         self.incoming = queue.Queue(maxsize=256)
         self.outgoing = queue.Queue()
         self.stop = threading.Event()
@@ -46,27 +59,27 @@ class Client:
 
     def __enter__(self):
         self.directory.mkdir(parents=True, exist_ok=True)
-        self.err = (self.directory/"app-server.stderr.log").open("wb")
+        self.err = (self.directory / "app-server.stderr.log").open("wb")
         initializing = False
         try:
-            from controller import __file__ as controller_file
             gated = os.name == "nt"
-            argv = [sys.executable, "-B", str(Path(controller_file).resolve()),
+            argv = [sys.executable, "-B", str(Path(runtime.__file__).resolve()),
                     "_child-gate", json.dumps(self.argv)] if gated else self.argv
             opts = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if gated else {"start_new_session": True}
-            self.p = subprocess.Popen(argv, cwd=self.c.repo, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
-                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.err, **opts)
+            self.p = subprocess.Popen(
+                argv, cwd=self.cwd, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.err, **opts,
+            )
             if gated:
                 self.p._superagent_job = WindowsJob(self.p)
-            if self.state is not None:
-                self.state["child_pid"] = self.p.pid
-                self.c.save(self.state, "process_started")
-            self.trace = (self.directory/"rpc.jsonl").open("a", encoding="utf-8")
+            if self.on_pid:
+                self.on_pid(self.p.pid, True)
+            self.trace = (self.directory / "rpc.jsonl").open("a", encoding="utf-8")
             self.reader = threading.Thread(target=self._read, daemon=True)
             self.writer = threading.Thread(target=self._write, args=(gated,), daemon=True)
             self.reader.start(); self.writer.start()
             initializing = True
-            self.call("initialize", {"clientInfo": {"name": "agy-codex", "version": "0.2.0"}}, timeout=20)
+            self.call("initialize", {"clientInfo": {"name": "agy-codex", "version": runtime.VERSION}}, timeout=20)
             self.send({"method": "initialized", "params": {}})
             return self
         except (Exception, KeyboardInterrupt) as exc:
@@ -114,7 +127,7 @@ class Client:
 
     def _receive(self, deadline, tick=None):
         while True:
-            if self.c.cancel.is_set():
+            if self.cancel.is_set():
                 raise Interrupted("App Server canceled; inspect the saved Thread before continuing.")
             if time.monotonic() >= deadline:
                 raise Interrupted("App Server RPC/Turn timeout; inspect the saved Thread before continuing.")
@@ -190,9 +203,8 @@ class Client:
                 for stream in (self.p.stdin, self.p.stdout):
                     if stream:
                         stream.close()
-                if self.state is not None:
-                    self.state.update(last_child_pid=self.p.pid, child_pid=None)
-                    self.c.save(self.state)
+                if self.on_pid:
+                    self.on_pid(self.p.pid, False)
         finally:
             if self.trace:
                 self.trace.close()
@@ -207,51 +219,93 @@ def final_text(turn, fallback=None):
     texts = [x.get("text") for x in turn.get("items", []) or []
              if x.get("type") == "agentMessage" and x.get("phase") == "final_answer"
              and isinstance(x.get("text"), str)]
-    return texts[-1] if texts else fallback
+    if texts:
+        return texts[-1]
+    # Fallback to any agentMessage text if phase is omitted by a provider/version.
+    any_texts = [x.get("text") for x in turn.get("items", []) or []
+                 if x.get("type") == "agentMessage" and isinstance(x.get("text"), str)]
+    return any_texts[-1] if any_texts else fallback
 
 
-def run(c, state, launcher, requested, directory, prompt, on_line):
-    from routing import verify_provider, validate_catalog, discover
+def _turn_sandbox_policy(sandbox):
+    if sandbox == "read-only":
+        return {"type": "readOnly", "networkAccess": False}
+    if sandbox == "danger-full-access":
+        return {"type": "dangerFullAccess"}
+    return None
+
+
+def _default_supplement_prompt(queued, has_schema):
+    suffix = " Return the requested JSON output schema for the complete current result." if has_schema else ""
+    return (
+        "Apply these queued user clarifications in the same task."
+        + suffix + "\n"
+        + json.dumps([{"id": m["id"], "text": m["text"]} for m in queued], ensure_ascii=False)
+    )
+
+
+def run(ws, state, save_fn, launcher, requested, artifact_dir, inbox_target,
+        prompt, on_line, *, sandbox="workspace-write", output_schema=None,
+        timeout=900, cancel=None, supplement_prompt_builder=None):
+    from routing import verify_provider
     from backends.usage import RoundUsage
-    usage = RoundUsage(directory)
-    with Client(c, launcher, directory, state, requested) as rpc:
-        atomic_json(directory/"invocation.json", {"backend": "app-server", "argv": rpc.argv,
-                    "cwd": str(c.repo), "started_at": now(), "codex_requested": requested})
-        if requested.get("model") or requested.get("model_provider"):
-            catalog = discover(rpc, requested.get("model_provider"), include_rates=False)
-            validate_catalog(requested, catalog["models"])
-            atomic_json(directory/"model-catalog.json", catalog)
-        params = {"cwd": str(c.repo), "sandbox": "workspace-write", "approvalPolicy": "never"}
+    import inbox
+
+    usage = RoundUsage(artifact_dir)
+
+    def on_pid(pid, started):
+        if started:
+            state["child_pid"] = pid
+            save_fn("process_started")
+        else:
+            state["last_child_pid"] = pid
+            state["child_pid"] = None
+            save_fn()
+
+    with Client(ws.root_path, launcher, artifact_dir, requested=requested,
+                timeout=timeout, cancel=cancel, on_pid=on_pid) as rpc:
+        atomic_json(artifact_dir / "invocation.json", {
+            "backend": "app-server", "argv": rpc.argv, "cwd": str(ws.root_path),
+            "sandbox": sandbox, "started_at": now(), "codex_requested": requested,
+        })
+        params = {"cwd": str(ws.root_path), "sandbox": sandbox, "approvalPolicy": "never"}
         if requested.get("model"):
             params["model"] = requested["model"]
         if requested.get("model_provider"):
             params["modelProvider"] = requested["model_provider"]
-        method = "thread/resume" if state["session_id"] else "thread/start"
-        if state["session_id"]:
-            params["threadId"] = state["session_id"]
+        existing_tid = state.get("thread_id")
+        method = "thread/resume" if existing_tid else "thread/start"
+        if existing_tid:
+            params["threadId"] = existing_tid
+            params["excludeTurns"] = True
         result = rpc.call(method, params, timeout=30)
         thread = result.get("thread") or {}
         thread_id = thread.get("id")
         if not isinstance(thread_id, str) or not thread_id:
             raise WorkflowError("App Server returned no Thread ID.")
-        if state["session_id"] and state["session_id"] != thread_id:
+        if existing_tid and existing_tid != thread_id:
             raise WorkflowError("Resumed App Server returned a different Session ID.")
-        if state["session_id"] and (thread.get("status") or {}).get("type") != "idle":
+        if existing_tid and (thread.get("status") or {}).get("type") != "idle":
             idle = rpc.call("thread/read", {"threadId": thread_id, "includeTurns": False}).get("thread") or {}
             if (idle.get("status") or {}).get("type") != "idle":
                 raise WorkflowError("Resumed Thread is not confirmed idle.")
         provider = result.get("modelProvider")
         if requested.get("model_provider") and provider != requested["model_provider"]:
             raise WorkflowError("App Server Thread provider differs from requested provider.")
-        verify_provider(c.root, provider)
-        state.update(backend="app-server", model_provider=provider, backend_model=result.get("model"),
-                     backend_effort=result.get("reasoningEffort"), active_turn_id=None)
+        verify_provider(ws.state_dir, provider)
+        state.update(
+            backend="app-server", model_provider=provider,
+            backend_model=result.get("model"), backend_effort=result.get("reasoningEffort"),
+            active_turn_id=None,
+        )
         completed, texts = {}, {}
-        with (directory/"codex.jsonl").open("wb") as stream:
+        with (artifact_dir / "codex.jsonl").open("wb") as stream:
             def emit(event):
                 raw = (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
                 stream.write(raw); stream.flush(); on_line(raw)
+
             emit({"type": "thread.started", "thread_id": thread_id})
+
             def notify(event):
                 m, args = event.get("method"), event.get("params") or {}
                 if args.get("threadId") != thread_id:
@@ -261,17 +315,15 @@ def run(c, state, launcher, requested, directory, prompt, on_line):
                     tid = turn.get("id")
                     if not tid:
                         return
-                    if m == "turn/started" and state.get("app_server_pending"):
+                    if m == "turn/started" and state.get("turn_pending"):
                         if state.get("active_turn_id") not in (None, tid):
                             raise WorkflowError("Unexpected concurrent Turn in owned Thread.")
                         state["active_turn_id"] = tid
-                        c.save(state, "turn_bound")
+                        save_fn("turn_bound")
                     if m == "turn/completed":
                         completed[tid] = turn
-                elif m == "thread/tokenUsage/updated" and state.get("app_server_pending"):
-                    # Resume can replay the previous Turn's usage before
-                    # turn/start binds its new ID. Only the bound current Turn
-                    # may establish or advance this round's usage baseline.
+                elif m == "thread/tokenUsage/updated" and state.get("turn_pending"):
+                    # Only the bound current Turn may establish or advance this round's usage baseline.
                     active = state.get("active_turn_id")
                     if active and args.get("turnId") == active:
                         usage.update(args)
@@ -284,37 +336,45 @@ def run(c, state, launcher, requested, directory, prompt, on_line):
                         emit({"type": "item." + m.split("/")[1], "item": {
                             "type": "command_execution" if typ == "commandExecution" else "file_change",
                             "command": item.get("command"), "exit_code": item.get("exitCode"),
-                            "status": item.get("status"), "changes": item.get("changes", [])}})
+                            "status": item.get("status"), "changes": item.get("changes", []),
+                        }})
+
             rpc.notify = notify
-            import inbox
             queued = []
             next_prompt = prompt
             while True:
-                # The window is unique to this Turn, including supplement Turns.
-                window = inbox.open_window(c, state)
+                window = inbox.open_window(inbox_target, state)
                 accepted = []
                 interrupt_requested = False
                 tid = None
                 turn = None
                 seen = 0
-                turn_params = {"threadId": thread_id, "input": [{"type": "text", "text": next_prompt}],
-                               "outputSchema": WORKER_SCHEMA}
+                turn_params = {
+                    "threadId": thread_id,
+                    "input": [{"type": "text", "text": next_prompt}],
+                }
+                if output_schema is not None:
+                    turn_params["outputSchema"] = output_schema
+                turn_policy = _turn_sandbox_policy(sandbox)
+                if turn_policy is not None:
+                    turn_params["sandboxPolicy"] = turn_policy
                 if requested.get("model"):
                     turn_params["model"] = requested["model"]
                 if requested.get("reasoning_effort"):
                     turn_params["effort"] = requested["reasoning_effort"]
-                state.update(app_server_pending=True, active_turn_id=None)
-                c.save(state, "turn_submitting")
+                state.update(turn_pending=True, active_turn_id=None)
+                save_fn("turn_submitting")
                 try:
                     started = rpc.call("turn/start", turn_params)
                     tid = (started.get("turn") or {}).get("id")
                     if not isinstance(tid, str) or not tid or state.get("active_turn_id") not in (None, tid):
                         raise WorkflowError("App Server Turn identity could not be reconciled.")
                     state["active_turn_id"] = tid
-                    c.save(state, "turn_bound")
+                    save_fn("turn_bound")
                     for message in queued:
-                        accepted.append(inbox.ack(c, message, "rpc_accepted", turn_id=tid,
-                                                  delivery_action="queue"))
+                        accepted.append(inbox.ack(inbox_target, message, "rpc_accepted",
+                                                  turn_id=tid, delivery_action="queue"))
+
                     def tick():
                         nonlocal interrupt_requested, seen
                         if tid in completed or interrupt_requested:
@@ -330,129 +390,160 @@ def run(c, state, launcher, requested, directory, prompt, on_line):
                                 continue
                             seen += 1
                             if seen > inbox.MAX_MESSAGES_PER_WINDOW and action != "interrupt":
-                                inbox.ack(c, message, "rejected", reason="Live message budget reached.")
+                                inbox.ack(inbox_target, message, "rejected", reason="Live message budget reached.")
                                 continue
                             if action == "steer":
                                 try:
-                                    answer = rpc.call("turn/steer", {"threadId": thread_id,
+                                    answer = rpc.call("turn/steer", {
+                                        "threadId": thread_id,
                                         "expectedTurnId": tid,
-                                        "input": [{"type": "text", "text": message["text"]}]})
+                                        "input": [{"type": "text", "text": message["text"]}],
+                                    })
                                 except RpcError as exc:
                                     if exc.code == -32600 and "no active turn to steer" in exc.message.lower():
                                         inbox.requeue(window, message)
                                         continue
-                                    inbox.ack(c, message, "rejected", reason=str(exc))
+                                    inbox.ack(inbox_target, message, "rejected", reason=str(exc))
                                     continue
                                 if answer.get("turnId") != tid:
                                     raise WorkflowError("Steer response has unexpected Turn ID.")
-                                accepted.append(inbox.ack(c, message, "rpc_accepted",
+                                accepted.append(inbox.ack(inbox_target, message, "rpc_accepted",
                                                           turn_id=tid, delivery_action="steer"))
                             elif action == "interrupt":
                                 interrupt_requested = True
                                 try:
                                     rpc.call("turn/interrupt", {"threadId": thread_id, "turnId": tid})
                                 except RpcError as exc:
-                                    # The response can arrive before the terminal notification.
-                                    # Only the known no-active-turn race is safe to await.
                                     stale = (exc.code == -32600 and exc.message.strip().lower().rstrip(".")
                                              in ("no active turn", "no active turn to interrupt"))
                                     if not stale:
                                         raise
-                                    inbox.ack(c, message, "deferred", reason="Turn ended before interrupt took effect; pause before further work.")
+                                    inbox.ack(inbox_target, message, "deferred",
+                                              reason="Turn ended before interrupt took effect; pause before further work.")
                                 else:
-                                    accepted.append(inbox.ack(c, message, "rpc_accepted",
+                                    accepted.append(inbox.ack(inbox_target, message, "rpc_accepted",
                                                               turn_id=tid, delivery_action="interrupt"))
+
                     rpc.wait(lambda: tid in completed, tick=tick)
                     turn = completed[tid]
                     status = turn.get("status")
                     for message in accepted:
-                        inbox.ack(c, message, {"completed": "turn_completed",
-                                  "interrupted": "turn_interrupted"}.get(status, "turn_failed"),
-                                  turn_id=tid)
-                    allow_queue = (status == "completed" and not interrupt_requested and
-                                   state.get("queue_turns", 0) < inbox.MAX_QUEUE_TURNS)
-                    queued, late_interrupt = inbox.drain(c, state, window, allow_queue=allow_queue,
-                                        reason="Turn interrupted/failed or supplement Turn budget reached; submit a new scoped task if needed.")
+                        inbox.ack(inbox_target, message, {
+                            "completed": "turn_completed",
+                            "interrupted": "turn_interrupted",
+                        }.get(status, "turn_failed"), turn_id=tid)
+                    allow_queue = (status == "completed" and not interrupt_requested
+                                   and state.get("queue_turns", 0) < inbox.MAX_QUEUE_TURNS)
+                    queued, late_interrupt = inbox.drain(
+                        inbox_target, state, window, allow_queue=allow_queue,
+                        reason="Turn interrupted/failed or supplement Turn budget reached; submit a new task if needed.",
+                    )
                     interrupt_requested = interrupt_requested or late_interrupt
                 except BaseException:
-                    # Preserve accepted/unknown delivery records. No automatic resend.
-                    inbox.drain(c, state, window, allow_queue=False,
+                    inbox.drain(inbox_target, state, window, allow_queue=False,
                                 reason="Turn outcome needs reconciliation; message was not submitted.")
                     raise
+
                 if status == "completed":
                     text = final_text(turn, texts.get(tid))
                     if isinstance(text, str):
-                        (directory/"last-message.md").write_text(text, encoding="utf-8")
-                    elif (directory/"last-message.md").exists():
-                        # A supplement's absent report must not reuse a prior Turn's report.
-                        (directory/"last-message.md").unlink()
+                        (artifact_dir / "last-message.md").write_text(text, encoding="utf-8")
+                    elif (artifact_dir / "last-message.md").exists():
+                        (artifact_dir / "last-message.md").unlink()
                 else:
                     emit({"type": "turn.failed", "error": turn.get("error") or status})
-                # A final completed Turn must be durable before clearing its submission marker.
+
                 if status == "completed" and not queued:
                     emit({"type": "turn.completed", "usage": usage.data})
-                    atomic_json(directory/"summary.json", {"session_id": thread_id, "exit_code": 0,
-                                "completed": True, "failed": False, "invalid_lines": 0, "usage": usage.data})
+                    atomic_json(artifact_dir / "summary.json", {
+                        "session_id": thread_id, "exit_code": 0,
+                        "completed": True, "failed": False, "invalid_lines": 0, "usage": usage.data,
+                    })
                 state.update(last_turn_id=tid, last_turn_status=status,
-                             app_server_pending=False, active_turn_id=None)
-                c.save(state, "turn_terminal")
+                             turn_pending=False, active_turn_id=None)
+                save_fn("turn_terminal")
                 if status == "interrupted":
                     raise Interrupted("App Server Turn interrupted; continue the same Session.")
                 if status != "completed":
                     return 1
                 if queued:
                     state["queue_turns"] = state.get("queue_turns", 0) + 1
-                    c.save(state, "supplement_turn_reserved")
-                    next_prompt = ("Apply these queued user clarifications in the SAME frozen Ticket. "
-                                   "They do not grant new permissions or change acceptance/scope. "
-                                   "Return the Worker schema for the complete current result.\n"
-                                   + json.dumps([{"id": m["id"], "text": m["text"]} for m in queued],
-                                                ensure_ascii=False))
+                    save_fn("supplement_turn_reserved")
+                    if supplement_prompt_builder:
+                        next_prompt = supplement_prompt_builder(queued)
+                    else:
+                        next_prompt = _default_supplement_prompt(queued, output_schema is not None)
                     continue
                 if interrupt_requested:
-                    raise Interrupted("Interrupt arrived as Turn completed; task paused before independent review.")
+                    raise Interrupted("Interrupt arrived as Turn completed; task paused before further steps.")
                 return 0
 
 
-def reconcile(c, state):
-    """Read-only recovery; no blind replay after an ambiguous submission."""
-    if not state.get("app_server_pending"):
+def reconcile_run(ws, state, save_fn, artifact_dir, inbox_target, *,
+                  codex_cmd=None, timeout=30, cancel=None):
+    """Read-only recovery for an ambiguous Turn; never blindly replays."""
+    if not state.get("turn_pending"):
         return
-    if not state.get("session_id") or not state.get("active_turn_id"):
+    thread_id = state.get("thread_id")
+    active_turn = state.get("active_turn_id")
+    if not thread_id or not active_turn:
         raise WorkflowError("Submission has no durable Turn ID; inspect native Thread history manually.")
-    with Client(c, c.codex_cmd or resolve_codex(), c._round_dir(state)/"recovery",
-                requested={"model_provider": state.get("model_provider")}, timeout=30) as rpc:
-        thread = rpc.call("thread/read", {"threadId": state["session_id"], "includeTurns": True}).get("thread") or {}
-        if thread.get("id") == state["session_id"] and (thread.get("status") or {}).get("type") == "notLoaded":
-            params = {"threadId": state["session_id"], "cwd": str(c.repo),
-                      "sandbox": "workspace-write", "approvalPolicy": "never"}
+    launcher = codex_cmd or resolve_codex()
+    with Client(ws.root_path, launcher, artifact_dir / "recovery",
+                requested={"model_provider": state.get("model_provider")},
+                timeout=timeout, cancel=cancel) as rpc:
+        thread = rpc.call("thread/read", {"threadId": thread_id, "includeTurns": False}).get("thread") or {}
+        if thread.get("id") == thread_id and (thread.get("status") or {}).get("type") == "notLoaded":
+            params = {
+                "threadId": thread_id, "cwd": str(ws.root_path),
+                "sandbox": state.get("sandbox", "workspace-write"),
+                "approvalPolicy": "never", "excludeTurns": True,
+            }
             if state.get("model_provider"):
                 params["modelProvider"] = state["model_provider"]
             resumed = rpc.call("thread/resume", params)
-            if (resumed.get("thread") or {}).get("id") != state["session_id"]:
+            if (resumed.get("thread") or {}).get("id") != thread_id:
                 raise WorkflowError("Recovery loaded a different Thread.")
             if state.get("model_provider") and resumed.get("modelProvider") != state["model_provider"]:
                 raise WorkflowError("Recovery loaded a different provider.")
-            thread = rpc.call("thread/read", {"threadId": state["session_id"], "includeTurns": True}).get("thread") or {}
-        if thread.get("id") != state["session_id"] or (thread.get("status") or {}).get("type") != "idle":
+            thread = rpc.call("thread/read", {"threadId": thread_id, "includeTurns": False}).get("thread") or {}
+        if thread.get("id") != thread_id or (thread.get("status") or {}).get("type") != "idle":
             raise WorkflowError("Saved App Server Thread is not confirmed idle.")
-        turns = thread.get("turns") or []
-        if not turns:
-            turns = rpc.call("thread/turns/list", {"threadId": state["session_id"]}).get("data", [])
-        turn = next((t for t in turns if t.get("id") == state["active_turn_id"]), None)
+        turns = rpc.call("thread/turns/list", {"threadId": thread_id}).get("data") or thread.get("turns") or []
+        turn = next((t for t in turns if t.get("id") == active_turn), None)
         if not turn or turn.get("status") not in ("completed", "failed", "interrupted"):
             raise WorkflowError("Saved Turn has no confirmed terminal outcome.")
         if turn["status"] == "completed":
             text = final_text(turn)
             if text is None:
                 raise WorkflowError("Completed Turn has no recoverable final answer; inspect evidence.")
-            directory = c._round_dir(state)
-            (directory/"last-message.md").write_text(text, encoding="utf-8")
+            (artifact_dir / "last-message.md").write_text(text, encoding="utf-8")
             from backends.usage import observed
-            atomic_json(directory/"summary.json", {"session_id": state["session_id"], "exit_code": 0,
-                        "completed": True, "failed": False, "invalid_lines": 0, "usage": observed(directory)})
-        from inbox import finish_accepted
-        finish_accepted(c, state["id"], state["active_turn_id"], turn["status"])
-        state.update(app_server_pending=False, last_turn_id=state["active_turn_id"],
-                     last_turn_status=turn["status"], active_turn_id=None)
-        c.save(state, "turn_reconciled")
+            obs = observed(artifact_dir)
+            state["usage"] = obs
+            atomic_json(artifact_dir / "summary.json", {
+                "session_id": thread_id, "exit_code": 0,
+                "completed": True, "failed": False, "invalid_lines": 0, "usage": obs,
+            })
+        import inbox
+        inbox.finish_accepted(inbox_target, active_turn, turn["status"])
+        state.update(
+            turn_pending=False, last_turn_id=active_turn,
+            last_turn_status=turn["status"], active_turn_id=None,
+        )
+        save_fn("turn_reconciled")
+
+
+def probe_windows_sandbox_readiness(cwd, launcher=None, timeout=15):
+    """Best-effort read-only probe of Codex's native windowsSandbox/readiness RPC."""
+    if os.name != "nt":
+        return None
+    import tempfile
+    try:
+        cmd = launcher or resolve_codex()
+        with tempfile.TemporaryDirectory(prefix="agy-winsandbox-") as directory:
+            with Client(cwd, cmd, directory, timeout=timeout) as rpc:
+                resp = rpc.call("windowsSandbox/readiness", {}, timeout=10)
+                return resp.get("status") if isinstance(resp, dict) else None
+    except Exception:
+        return None

@@ -4,11 +4,11 @@ import os
 
 
 def load(root):
-    from controller import WorkflowError, read_json, codex_settings
+    from runtime import WorkflowError, read_json, codex_settings
     global_path = Path(os.environ.get("AGY_CODEX_CONFIG", str(
-        Path.home()/".gemini"/"config"/"agy-codex"/"config.json"))).expanduser()
+        Path.home() / ".gemini" / "config" / "agy-codex" / "config.json"))).expanduser()
     result = {"codex": {}, "routing": {}}
-    for path in (global_path, root/"config.json"):
+    for path in (global_path, Path(root) / "config.json"):
         try:
             value = read_json(path)
         except FileNotFoundError:

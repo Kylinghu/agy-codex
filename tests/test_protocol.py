@@ -98,7 +98,7 @@ class ProtocolTests(unittest.TestCase):
             monotonic=lambda: time.monotonic() + (self.controller.timeout + 1 if bound else 0),
             strftime=time.strftime, gmtime=time.gmtime,
         )
-        with mock.patch.object(sa, "time", clock), mock.patch.object(self.controller, "save", side_effect=save):
+        with mock.patch.object(sa.runtime, "time", clock), mock.patch.object(self.controller, "save", side_effect=save):
             return self.controller.run(ticket_id or self.ticket_id)
 
     def review(self, decision="PASS", packet=None):
@@ -169,8 +169,8 @@ class ProtocolTests(unittest.TestCase):
 
     def test_windows_metadata_read_retries_transient_permission_error(self):
         path = self.global_config
-        with mock.patch.object(sa.sys, "platform", "win32"), \
-                mock.patch.object(sa.time, "sleep") as sleep, \
+        with mock.patch.object(sa.runtime.sys, "platform", "win32"), \
+                mock.patch.object(sa.runtime.time, "sleep") as sleep, \
                 mock.patch.object(Path, "read_text", side_effect=[
                     PermissionError(13, "sharing violation"), '{"value": 1}']) as read:
             self.assertEqual(sa.read_json(path), {"value": 1})
@@ -189,9 +189,9 @@ class ProtocolTests(unittest.TestCase):
             if len(attempts) == 1:
                 raise PermissionError(13, "sharing violation")
             return original_replace(source, destination)
-        with mock.patch.object(sa.sys, "platform", "win32"), \
-                mock.patch.object(sa.time, "sleep") as sleep, \
-                mock.patch.object(sa.os, "replace", side_effect=replace):
+        with mock.patch.object(sa.runtime.sys, "platform", "win32"), \
+                mock.patch.object(sa.runtime.time, "sleep") as sleep, \
+                mock.patch.object(sa.runtime.os, "replace", side_effect=replace):
             sa.atomic_json(path, {"value": "new"})
         self.assertEqual(attempts, [attempts[0]] * 2)
         self.assertEqual(sa.read_json(path), {"value": "new"})
@@ -201,9 +201,9 @@ class ProtocolTests(unittest.TestCase):
     def test_windows_metadata_permanent_failure_is_bounded_and_preserves_old_file(self):
         path = self.global_config
         sa.atomic_json(path, {"value": "old"})
-        with mock.patch.object(sa.sys, "platform", "win32"), \
-                mock.patch.object(sa.time, "sleep") as sleep, \
-                mock.patch.object(sa.os, "replace", side_effect=PermissionError(13, "denied")) as replace:
+        with mock.patch.object(sa.runtime.sys, "platform", "win32"), \
+                mock.patch.object(sa.runtime.time, "sleep") as sleep, \
+                mock.patch.object(sa.runtime.os, "replace", side_effect=PermissionError(13, "denied")) as replace:
             with self.assertRaises(PermissionError):
                 sa.atomic_json(path, {"value": "new"})
         self.assertEqual(replace.call_count, 6)
@@ -216,15 +216,15 @@ class ProtocolTests(unittest.TestCase):
         for platform, error in (("win32", FileNotFoundError(2, "missing")),
                                 ("linux", PermissionError(13, "denied"))):
             with self.subTest(platform=platform, error=error), \
-                    mock.patch.object(sa.sys, "platform", platform), \
-                    mock.patch.object(sa.time, "sleep") as sleep, \
+                    mock.patch.object(sa.runtime.sys, "platform", platform), \
+                    mock.patch.object(sa.runtime.time, "sleep") as sleep, \
                     mock.patch.object(Path, "read_text", side_effect=error) as read:
                 with self.assertRaises(type(error)):
                     sa.read_json(path)
                 self.assertEqual(read.call_count, 1)
                 sleep.assert_not_called()
-        with mock.patch.object(sa.sys, "platform", "win32"), \
-                mock.patch.object(sa.time, "sleep") as sleep, \
+        with mock.patch.object(sa.runtime.sys, "platform", "win32"), \
+                mock.patch.object(sa.runtime.time, "sleep") as sleep, \
                 mock.patch.object(Path, "read_text", return_value="{invalid") as read:
             with self.assertRaises(json.JSONDecodeError):
                 sa.read_json(path)

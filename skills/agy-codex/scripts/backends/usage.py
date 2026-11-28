@@ -4,7 +4,7 @@ A resumed Thread may already have usage. The first current-round update's
 total minus its last increment establishes the baseline; subsequent cumulative
 snapshots replace the high-water mark, never sum repeated notifications.
 """
-from controller import atomic_json, read_json
+from runtime import atomic_json, read_json
 
 FIELDS = {"inputTokens": "input_tokens", "cachedInputTokens": "cached_input_tokens",
           "outputTokens": "output_tokens"}

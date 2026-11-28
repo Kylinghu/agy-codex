@@ -44,7 +44,8 @@ class AppServerTests(unittest.TestCase):
         packet = self.c.packet(self.f.ticket_id)
         self.assertTrue(packet["all_tests_passed"])
         self.assertEqual(packet["worker_report"]["outcome"], "done")
-        self.assertNotIn("NOT_FOR_LOGS", (self.c._round_dir(state)/"model-catalog.json").read_text())
+        self.assertEqual(self.calls("model/list"), [])
+        self.assertFalse((self.c._round_dir(state)/"model-catalog.json").exists())
         final = self.c.verdict(self.f.ticket_id, self.f.review(), source="test")
         self.assertEqual(final["status"], "PASS")
 

@@ -1,5 +1,6 @@
 """Offline v2 stdio protocol double; no external calls."""
 import json
+import os
 from pathlib import Path
 import sys
 import uuid
@@ -9,7 +10,9 @@ def main():
     if sys.argv[1:2] != ["app-server"]:
         from fake_codex import main as exec_main
         return exec_main()
-    root = Path.cwd()/".git"
+    ctrl_env = os.environ.get("AGY_FAKE_CONTROL_DIR")
+    root = Path(ctrl_env) if ctrl_env else (Path.cwd() / ".git")
+    root.mkdir(parents=True, exist_ok=True)
     control = root/"fake-app-control.json"
     mode = json.loads(control.read_text(encoding="utf-8")) if control.exists() else {}
     state_path = root/"fake-app-thread.json"
@@ -119,7 +122,7 @@ def main():
         elif method == "thread/turns/list":
             response(rid, {"data": state.get("turns", [])})
         elif method == "turn/start":
-            if params.get("threadId") != state.get("id") or not params.get("outputSchema"):
+            if params.get("threadId") != state.get("id"):
                 return 64
             if mode.get("replay_previous_usage") and state["turns"]:
                 # CLI 0.171.0 may replay the previous Turn's last usage
